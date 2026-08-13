@@ -1,0 +1,23 @@
+# secrets
+.env
+
+# local warehouse + regenerable data
+data/*.duckdb
+data/*.duckdb.wal
+data/sample/
+
+# dbt artifacts
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+logs/
+
+# python
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# dbt local state
+dbt/.user.yml
