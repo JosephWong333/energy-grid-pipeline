@@ -1,0 +1,55 @@
+# Pipeline configuration.
+# Everything the ingestion layer needs to know lives here — no magic constants in code.
+
+database:
+  # Local dev warehouse. Override with GRID_DB_PATH env var
+  # (e.g. "md:energy_grid" to target MotherDuck in prod).
+  path: "data/energy_grid.duckdb"
+
+eia:
+  base_url: "https://api.eia.gov/v2"
+  # Rows per request. 5000 is the API's documented maximum.
+  page_size: 5000
+  # Seconds to sleep between successful requests (politeness / rate-limit headroom).
+  sleep_between_requests: 0.45
+  # Retry policy for 429s and 5xx responses.
+  max_retries: 5
+  backoff_base_seconds: 2.0
+  request_timeout_seconds: 30
+
+backfill:
+  # Start of history to load. EIA-930 hourly coverage is solid from mid-2018 onward.
+  start: "2019-01-01"
+  # Backfill iterates one (route, respondent, month) window at a time so every
+  # request stays small, progress is resumable, and a failure never loses work.
+  window: "month"
+
+incremental:
+  # On each incremental run, re-fetch this many hours before the stored watermark.
+  # EIA revises recent hours as balancing authorities restate data, so a pure
+  # "only fetch new" strategy silently keeps stale values. 72h covers the vast
+  # majority of restatements.
+  lookback_hours: 72
+
+# Balancing authorities to track. Codes are EIA-930 respondent codes.
+# This list is the single source of truth for ingestion; the dbt seed
+# (dbt/seeds/balancing_authorities.csv) carries the descriptive attributes.
+balancing_authorities:
+  - CISO   # California ISO
+  - ERCO   # ERCOT (Texas)
+  - MISO   # Midcontinent ISO
+  - PJM    # PJM Interconnection
+  - NYIS   # New York ISO
+  - ISNE   # ISO New England
+  - SWPP   # Southwest Power Pool
+  - BPAT   # Bonneville Power Administration
+  - FPL    # Florida Power & Light
+  - DUK    # Duke Energy Carolinas
+
+routes:
+  region_data:
+    path: "electricity/rto/region-data"
+    # D = demand, NG = net generation, TI = total interchange
+    types: ["D", "NG", "TI"]
+  fuel_mix:
+    path: "electricity/rto/fuel-type-data"
