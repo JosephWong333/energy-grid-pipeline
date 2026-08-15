@@ -1,0 +1,45 @@
+{
+  "response": {
+    "total": "4",
+    "dateFormat": "YYYY-MM-DD\"T\"HH24",
+    "frequency": "hourly",
+    "data": [
+      {
+        "period": "2026-06-01T00",
+        "respondent": "CISO",
+        "respondent-name": "California Independent System Operator",
+        "type": "D",
+        "type-name": "Demand",
+        "value": "21500",
+        "value-units": "megawatthours"
+      },
+      {
+        "period": "2026-06-01T01",
+        "respondent": "CISO",
+        "respondent-name": "California Independent System Operator",
+        "type": "D",
+        "type-name": "Demand",
+        "value": 20874.5,
+        "value-units": "megawatthours"
+      },
+      {
+        "period": "2026-06-01T02",
+        "respondent": "CISO",
+        "respondent-name": "California Independent System Operator",
+        "type": "D",
+        "type-name": "Demand",
+        "value": null,
+        "value-units": "megawatthours"
+      },
+      {
+        "period": "2026-06-01T03",
+        "respondent": "CISO",
+        "respondent-name": "California Independent System Operator",
+        "type": "TI",
+        "type-name": "Total interchange",
+        "value": "-3120.0",
+        "value-units": "megawatthours"
+      }
+    ]
+  }
+}
