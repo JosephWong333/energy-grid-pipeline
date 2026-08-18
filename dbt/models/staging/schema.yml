@@ -1,0 +1,64 @@
+version: 2
+
+models:
+  - name: stg_eia__grid_metrics
+    description: Typed, renamed, quality-flagged demand / net generation / interchange.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, period_utc, metric_code]
+    columns:
+      - name: period_utc
+        tests: [not_null]
+      - name: ba_code
+        tests:
+          - not_null
+          # warn (not error): a BA appearing in the feed before it's added to
+          # the seed shouldn't halt the pipeline — it should tell us.
+          - relationships:
+              arguments:
+                to: ref('balancing_authorities')
+                field: ba_code
+              config:
+                severity: warn
+      - name: metric_code
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [D, NG, TI]
+      - name: metric_name
+        tests:
+          - accepted_values:
+              arguments:
+                values: [demand, net_generation, total_interchange]
+
+  - name: stg_eia__fuel_mix
+    description: Typed, quality-flagged hourly generation by fuel.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, period_utc, fuel_code]
+    columns:
+      - name: period_utc
+        tests: [not_null]
+      - name: ba_code
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('balancing_authorities')
+                field: ba_code
+              config:
+                severity: warn
+      - name: fuel_code
+        tests:
+          - not_null
+          # warn: EIA occasionally adds fuel codes; unmapped codes roll up to
+          # 'other' downstream and this test surfaces them.
+          - relationships:
+              arguments:
+                to: ref('fuel_types')
+                field: fuel_code
+              config:
+                severity: warn

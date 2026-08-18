@@ -1,0 +1,32 @@
+version: 2
+
+sources:
+  - name: eia_raw
+    description: Raw EIA-930 hourly data landed by the Python ingestion layer.
+    schema: raw
+    loaded_at_field: _ingested_at
+    freshness:
+      warn_after: {count: 36, period: hour}
+      error_after: {count: 96, period: hour}
+    tables:
+      - name: eia_region_data
+        description: >
+          One row per (respondent, hour UTC, metric). Metrics: D (demand),
+          NG (net generation), TI (total interchange; positive = net export).
+        columns:
+          - name: period_utc
+            tests: [not_null]
+          - name: respondent
+            tests: [not_null]
+          - name: metric_code
+            tests: [not_null]
+
+      - name: eia_fuel_mix
+        description: One row per (respondent, hour UTC, fuel code) of net generation.
+        columns:
+          - name: period_utc
+            tests: [not_null]
+          - name: respondent
+            tests: [not_null]
+          - name: fuel_code
+            tests: [not_null]
