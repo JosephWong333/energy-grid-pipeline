@@ -1,0 +1,83 @@
+version: 2
+
+seeds:
+  - name: balancing_authorities
+    description: >
+      Descriptive attributes for each EIA-930 balancing authority tracked by
+      the pipeline. `timezone` is the predominant IANA zone used to derive
+      local wall-clock time. Note: MISO spans multiple zones; its market runs
+      on Eastern Prevailing Time (EPT = EST/EDT per the MISO market
+      timetable), so the seed maps it to America/New_York.
+    columns:
+      - name: ba_code
+        description: EIA-930 respondent code (primary key).
+        tests: [unique, not_null]
+      - name: ba_name
+        tests: [not_null]
+      - name: timezone
+        description: IANA timezone used for UTC -> local conversion.
+        tests: [not_null]
+      - name: is_iso_rto
+        description: True if the BA is an organized ISO/RTO market.
+        tests: [not_null]
+      - name: expects_solar
+        description: Fail-closed declaration that this BA reports utility-scale solar; an absent solar row on a declared BA invalidates net load even if the whole month is missing. Adjust from evidence after the first real backfill.
+        tests: [not_null]
+      - name: expects_wind
+        description: Same declaration for wind (FPL legitimately reports none).
+        tests: [not_null]
+
+  - name: fuel_types
+    description: >
+      EIA-930 fuel codes with two deliberately distinct flags: `is_renewable`
+      (wind/solar/hydro) and `is_carbon_free` (renewables + nuclear). Nuclear
+      is carbon-free but not renewable; the distinction matters for any real
+      decarbonization analysis.
+    columns:
+      - name: fuel_code
+        tests: [unique, not_null]
+      - name: fuel_group
+        description: Pivot key for the intermediate layer; spans the 2024Q3 vocabulary change (SUN+SNB -> solar, WND+WNB -> wind).
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [coal, natural_gas, oil, nuclear, hydro, solar, wind, geothermal, storage, other]
+      - name: fuel_category
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [fossil, nuclear, renewable, storage, other]
+      - name: is_renewable
+        tests: [not_null]
+      - name: is_carbon_free
+        tests: [not_null]
+
+  - name: fuel_group_retirements
+    description: >
+      Explicit contract endings for expected fuel groups. Group expectations
+      persist from FIRST observation forever — a sustained outage can never
+      age into "normal" — so a legitimate retirement (a BA closing its last
+      coal plant) must be declared here intentionally, with the first month
+      the group is allowed to be absent. Ships empty by design.
+    columns:
+      - name: retired_month
+        tests: [not_null]
+      - name: ba_code
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('balancing_authorities')
+                field: ba_code
+      - name: fuel_group
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [coal, natural_gas, oil, nuclear, hydro, solar, wind, geothermal, storage, other]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, fuel_group]

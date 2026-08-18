@@ -1,0 +1,22 @@
+energy_grid:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('GRID_DB_PATH', 'data/energy_grid.duckdb') }}"
+      threads: 4
+
+    ci:
+      type: duckdb
+      # Same env contract as dev, but defaults to the fixture warehouse so a
+      # CI run can never touch (or create) a real-named database file.
+      path: "{{ env_var('GRID_DB_PATH', 'data/dev_fixtures.duckdb') }}"
+      threads: 4
+
+    # Cloud target: MotherDuck (serverless DuckDB). Requires MOTHERDUCK_TOKEN
+    # in the environment. Set GRID_DB_PATH=md:energy_grid for ingestion so the
+    # Python side writes to the same database.
+    prod:
+      type: duckdb
+      path: "md:energy_grid"
+      threads: 4

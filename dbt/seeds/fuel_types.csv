@@ -1,0 +1,17 @@
+fuel_code,fuel_name,fuel_category,fuel_group,is_renewable,is_carbon_free
+COL,Coal,fossil,coal,false,false
+NG,Natural gas,fossil,natural_gas,false,false
+OIL,Petroleum,fossil,oil,false,false
+NUC,Nuclear,nuclear,nuclear,false,true
+WAT,Conventional hydroelectric,renewable,hydro,true,true
+SUN,Solar (no integrated storage),renewable,solar,true,true
+SNB,Solar with integrated battery storage,renewable,solar,true,true
+WND,Wind (no integrated storage),renewable,wind,true,true
+WNB,Wind with integrated battery storage,renewable,wind,true,true
+GEO,Geothermal,renewable,geothermal,true,true
+PS,Pumped hydro storage,storage,storage,false,false
+BAT,Battery storage,storage,storage,false,false
+OES,Other energy storage,storage,storage,false,false
+OTH,Other,other,other,false,false
+UNK,Unknown,other,other,false,false
+UES,Unknown energy storage,storage,storage,false,false

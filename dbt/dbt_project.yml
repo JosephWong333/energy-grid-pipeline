@@ -1,0 +1,45 @@
+name: energy_grid
+version: "1.0.0"
+profile: energy_grid
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+analysis-paths: ["analyses"]
+
+target-path: target
+clean-targets: [target, dbt_packages]
+
+vars:
+  # How far back the incremental fact reprocesses on every run.
+  # EIA restates recent hours as balancing authorities revise their reports;
+  # 96h covers nearly all restatements while keeping incremental runs cheap.
+  late_arrival_lookback_hours: 96
+  # EIA-930 identity tolerances: relative band plus an absolute floor so
+  # small-BA hours aren't failed on rounding noise.
+  # Live EIA-930 data reconciles only loosely (BA reporting boundaries do
+  # not net out cleanly); tight tolerances would warn every night and become
+  # noise. These are wide sanity bands that catch unit/sign errors; the
+  # mart_identity_residuals model is the tool for actually WATCHING drift,
+  # and per-BA tuning should follow the first real backfill.
+  recon_rel_tol: 0.25
+  recon_abs_floor_mwh: 1500
+
+models:
+  energy_grid:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
+
+seeds:
+  energy_grid:
+    +schema: seeds
+    fuel_group_retirements:
+      +column_types:
+        ba_code: varchar
+        fuel_group: varchar
+        retired_month: date

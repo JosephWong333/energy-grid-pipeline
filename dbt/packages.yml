@@ -1,0 +1,4 @@
+packages:
+  # Pinned to an exact tag via git for reproducible builds.
+  - git: "https://github.com/dbt-labs/dbt-utils.git"
+    revision: "1.3.1"
