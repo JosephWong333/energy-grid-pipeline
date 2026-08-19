@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: int_grid_metrics_pivoted
+    description: One row per BA-hour with demand / net generation / interchange as columns.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, period_utc]
+    columns:
+      - name: ba_code
+        tests: [not_null]
+      - name: period_utc
+        tests: [not_null]
+      - name: demand_mwh
+        tests:
+          # Invariant: any negative demand must have been caught by the
+          # anomaly flag upstream. Unflagged rows are required non-negative.
+          - non_negative:
+              config:
+                where: "not coalesce(has_negative_anomaly, false)"
+
+  - name: int_fuel_mix_by_category
+    description: >
+      One row per BA-hour with generation rolled up by fuel and category,
+      including renewable / carbon-free totals. Unmapped fuel codes fall into
+      other_mwh and are counted in unmapped_fuel_reports.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, period_utc]
+    columns:
+      - name: ba_code
+        tests: [not_null]
+      - name: period_utc
+        tests: [not_null]
+      - name: total_fuel_mwh
+        tests:
+          - non_negative:
+              config:
+                severity: warn
+      - name: n_fuel_reports
+        tests: [not_null]
+      - name: unmapped_fuel_reports
+        tests: [not_null]
+      - name: has_fuel_negative_anomaly
+        tests: [not_null]
+      - name: has_fuel_missing_value
+        tests: [not_null]
+      - name: has_fuel_extreme_outlier
+        tests: [not_null]
+      - name: has_vre_missing_value
+        tests: [not_null]
+      - name: has_vre_negative_anomaly
+        tests: [not_null]
+      - name: has_fuel_group_absent
+        description: Any expected fuel group (this month ∪ prior month ∪ seed VRE declarations) has no row this hour; gates fuel-mix validity, not net load.
+        tests: [not_null]
+      - name: has_vre_absent
+        description: A solar/wind row is absent this hour although this BA reports that group in this calendar month — publication lag, not zero.
+        tests: [not_null]
