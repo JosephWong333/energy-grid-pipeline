@@ -13,6 +13,8 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      GRID_DB_PATH: data/dev_fixtures.duckdb
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,8 +22,27 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
       - name: Lint (ruff)
         run: ruff check .
       - name: Unit tests (pytest)
         run: pytest
+      # Full pipeline verification with ZERO credentials: deterministic,
+      # API-shaped fixtures flow through the real parse + upsert path, then
+      # dbt materializes every model and runs the entire test suite.
+      - name: Generate dev fixtures
+        run: python scripts/generate_dev_fixtures.py
+      - name: Ingest fixtures (real load path)
+        run: python -m grid_pipeline.ingest --mode fixtures
+      - name: dbt deps
+        run: dbt deps --project-dir dbt --profiles-dir dbt
+      - name: dbt build (models + all data tests)
+        run: dbt build --project-dir dbt --profiles-dir dbt --target ci
+      # A fresh build proves nothing about the is_incremental() branch, which
+      # is what every scheduled run after deployment actually executes.
+      - name: dbt build (incremental path, same warehouse)
+        run: dbt build --project-dir dbt --profiles-dir dbt --target ci
+      - name: Render charts (smoke test)
+        run: python scripts/make_charts.py
