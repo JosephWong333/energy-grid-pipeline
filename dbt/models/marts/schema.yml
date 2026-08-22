@@ -1,0 +1,253 @@
+version: 2
+
+models:
+  - name: fct_grid_hourly
+    description: >
+      One row per (balancing authority, UTC hour): demand, generation,
+      interchange, fuel mix, net load, and renewable / carbon-free shares.
+      Incremental with a 96h late-arrival lookback (delete+insert) because
+      EIA restates recent hours. Quality flags are carried, not filtered —
+      downstream marts decide their own policy.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, period_utc]
+      # Mart-level freshness: warn if the newest hour goes stale.
+      - dbt_utils.recency:
+          arguments:
+            datepart: day
+            field: period_utc
+            interval: 3
+          config:
+            severity: warn
+    columns:
+      - name: ba_code
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('balancing_authorities')
+                field: ba_code
+      - name: period_utc
+        tests: [not_null]
+      - name: period_local
+        tests: [not_null]
+      - name: local_date
+        tests: [not_null]
+      - name: local_hour
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 23
+                inclusive: true
+      - name: demand_mwh
+        description: Hourly demand. Negative raw values are flagged, not dropped.
+        tests:
+          # The anomaly flag must catch every negative value: unflagged rows
+          # are required non-negative at error severity — this tests the
+          # flagging logic itself.
+          - non_negative:
+              config:
+                where: "not coalesce(has_negative_anomaly, false)"
+      - name: net_generation_mwh
+        tests:
+          - non_negative:
+              config:
+                where: "not coalesce(has_negative_anomaly, false)"
+      - name: renewable_share
+        description: >
+          Renewable / total reported generation. The [0,1] invariant only
+          holds when no signed fuel is charging — battery/pumped storage
+          land in storage_mwh, but hybrid solar/wind-with-battery (SNB/WNB)
+          charge INTO the solar and wind groups, so all three are scoped;
+          warn severity because floating-point summation can graze the
+          boundaries.
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+              config:
+                severity: warn
+                where: "coalesce(storage_mwh, 0) >= 0 and coalesce(solar_mwh, 0) >= 0 and coalesce(wind_mwh, 0) >= 0"
+      - name: carbon_free_share
+        description: >
+          Carbon-free (renewables + nuclear) / total reported generation.
+          Same storage-charging exemption as renewable_share.
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+              config:
+                severity: warn
+                where: "coalesce(storage_mwh, 0) >= 0 and coalesce(solar_mwh, 0) >= 0 and coalesce(wind_mwh, 0) >= 0"
+      - name: has_grid_implausible_value
+        description: The identity was evaluated and failed the 50% band (5 GWh floor) — proven-bad data, as opposed to unverifiable.
+        tests: [not_null]
+      - name: is_grid_identity_valid
+        description: The identity was evaluable AND held. The publication precondition for everything demand-derived — an hour whose identity cannot be checked is unpublishable, not trusted.
+        tests: [not_null]
+      - name: is_region_complete
+        description: Demand, net generation, and interchange all present for the hour.
+        tests: [not_null]
+      - name: is_fuel_reported
+        description: The hour's fuel-mix report has arrived at all. Absence is EIA publication lag, not zero generation.
+        tests: [not_null]
+      - name: is_net_load_valid
+        description: net_load_mwh is only computed when true; missing fuel data is never treated as zero renewables.
+        tests: [not_null]
+      - name: has_fuel_negative_anomaly
+        tests: [not_null]
+      - name: has_fuel_missing_value
+        tests: [not_null]
+      - name: has_vre_missing_value
+        description: A solar or wind VALUE was null this hour; net load is invalidated rather than computed with a zero stand-in.
+        tests: [not_null]
+      - name: has_vre_absent
+        description: Solar/wind row absent although this BA reports the group this month; net load invalidated.
+        tests: [not_null]
+      - name: has_fuel_extreme_outlier
+        description: A fuel value beyond the sanity ceiling; net load and identity tests exclude the hour.
+        tests: [not_null]
+      - name: has_vre_negative_anomaly
+        tests: [not_null]
+      - name: has_fuel_group_absent
+        tests: [not_null]
+      - name: has_fuel_implausible_value
+        description: A single fuel group exceeds 3× the hour's own net generation — BA-relative, hour-local physics bound (catches 400 GWh solar in a 25 GWh hour that a global unit-error ceiling misses).
+        tests: [not_null]
+      - name: is_fuel_mix_valid
+        description: Report present, every fuel value populated and unflagged, every code mapped. Stricter than net-load validity — shares need the whole denominator.
+        tests: [not_null]
+
+  - name: mart_grid_daily
+    description: >
+      Daily rollup per BA with volume-weighted shares, peak analytics, and
+      anomaly counts. Anomalous hours are excluded from aggregates but
+      counted in n_anomalous_hours.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, local_date]
+    columns:
+      - name: ba_code
+        tests: [not_null]
+      - name: local_date
+        tests: [not_null]
+      - name: demand_gwh
+        tests:
+          - not_null
+          - non_negative
+      - name: hours_present
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 26
+                inclusive: true
+      - name: hours_valid
+        description: Clean hours with a non-null demand observation.
+        tests: [not_null]
+      - name: hours_expected
+        description: Exact expected local hours for this date and timezone — 23 spring-forward, 25 fall-back, 24 otherwise.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [23, 24, 25]
+                quote: false
+      - name: is_complete_day
+        description: hours_valid equals hours_expected; the only rows fair for day-over-day comparison.
+        tests: [not_null]
+      - name: is_net_load_complete_day
+        description: Every expected hour has a VALID net load (fuel present, VRE intact, no outliers). Publication gate for the duck curve.
+        tests: [not_null]
+      - name: is_fuel_mix_complete_day
+        description: Every expected hour has a fully valid fuel mix. Publication gate for generation-share analytics.
+        tests: [not_null]
+      - name: hours_fuel_mix_valid
+        tests: [not_null]
+      - name: n_fuel_anomalous_hours
+        tests: [not_null]
+      - name: load_factor
+        description: avg demand / peak demand; bounded by construction.
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+      - name: renewable_share
+        description: >
+          Volume-weighted daily share (sum/sum, not an average of hourly
+          ratios). Same signed-fuel charging exemption as the hourly tests,
+          at day grain.
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+              config:
+                severity: warn
+                where: "coalesce(storage_gwh, 0) >= 0 and coalesce(solar_gwh, 0) >= 0 and coalesce(wind_gwh, 0) >= 0"
+      - name: carbon_free_share
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+              config:
+                severity: warn
+                where: "coalesce(storage_gwh, 0) >= 0 and coalesce(solar_gwh, 0) >= 0 and coalesce(wind_gwh, 0) >= 0"
+      - name: n_anomalous_hours
+        tests: [not_null]
+
+  - name: mart_identity_residuals
+    description: >
+      Daily per-BA residual distributions for both EIA-930 identities.
+      The monitoring companion to the loose identity sanity tests — tune
+      per-BA tolerances from this after the first real backfill.
+    columns:
+      - name: ba_code
+        tests: [not_null]
+      - name: local_date
+        tests: [not_null]
+      - name: n_hours
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, local_date]
+
+  - name: mart_hourly_profile
+    description: Average hourly shape per (BA, month, local hour); duck-curve source.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba_code, month, local_hour]
+    columns:
+      - name: ba_code
+        tests: [not_null]
+      - name: month
+        tests: [not_null]
+      - name: local_hour
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 23
+                inclusive: true
+      - name: n_hours
+        tests:
+          - not_null
+          - non_negative
+      - name: avg_demand_mwh
+        tests: [not_null]
