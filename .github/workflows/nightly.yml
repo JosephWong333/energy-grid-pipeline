@@ -44,7 +44,9 @@ jobs:
         run: dbt deps --project-dir dbt --profiles-dir dbt
 
       - name: dbt build (prod)
-        run: dbt build --project-dir dbt --profiles-dir dbt --target prod --vars '{expect_full_history: true}'
+        run: >-
+          dbt build --project-dir dbt --profiles-dir dbt --target prod
+          --vars '{expect_full_history: true}'
 
       - name: Source freshness
         run: dbt source freshness --project-dir dbt --profiles-dir dbt --target prod
