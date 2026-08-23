@@ -1,0 +1,50 @@
+name: Nightly refresh
+
+# Real-data run: incremental ingest from the EIA API into MotherDuck, then
+# dbt build + source freshness against the prod target.
+#
+# Required repository secrets:
+#   EIA_API_KEY       — free key from https://www.eia.gov/opendata/register.php
+#   MOTHERDUCK_TOKEN  — from https://motherduck.com (free tier is plenty)
+
+on:
+  schedule:
+    - cron: "25 7 * * *"   # daily 07:25 UTC (~00:25 Pacific)
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+      MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+      GRID_DB_PATH: "md:energy_grid"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+
+      - name: Incremental ingest (EIA API -> MotherDuck)
+        run: python -m grid_pipeline.ingest --mode incremental
+
+      - name: dbt deps
+        run: dbt deps --project-dir dbt --profiles-dir dbt
+
+      - name: dbt build (prod)
+        run: dbt build --project-dir dbt --profiles-dir dbt --target prod --vars '{expect_full_history: true}'
+
+      - name: Source freshness
+        run: dbt source freshness --project-dir dbt --profiles-dir dbt --target prod
