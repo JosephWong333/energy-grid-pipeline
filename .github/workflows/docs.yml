@@ -1,0 +1,66 @@
+name: Publish dbt docs
+
+# Builds the fixture warehouse, generates dbt docs (lineage DAG + model and
+# column documentation), and publishes the static site to GitHub Pages.
+# One-time setup: repo Settings -> Pages -> Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+
+      - name: Build fixture warehouse
+        run: |
+          python scripts/generate_dev_fixtures.py
+          python -m grid_pipeline.ingest --mode fixtures
+
+      - name: dbt deps + docs generate
+        run: |
+          dbt deps --project-dir dbt --profiles-dir dbt
+          dbt build --project-dir dbt --profiles-dir dbt --target ci
+          dbt docs generate --project-dir dbt --profiles-dir dbt --target ci --static
+
+      # dbt's --static flag bundles everything into static_index.html;
+      # publish it as index.html for Pages.
+      - name: Prepare index
+        run: cp dbt/target/static_index.html dbt/target/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dbt/target
+
+  deploy:
+    needs: build-docs
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
