@@ -28,10 +28,10 @@ flowchart LR
     B -->|idempotent upserts| C[(DuckDB<br/>raw schema)]
     C --> D[dbt staging<br/>type + flag]
     D --> E[dbt intermediate<br/>pivot + categorize]
-    E --> F[dbt marts<br/>fct_grid_hourly &#40;incremental&#41;<br/>mart_grid_daily<br/>mart_hourly_profile]
+    E --> F["dbt marts<br/>fct_grid_hourly (incremental)<br/>mart_grid_daily<br/>mart_hourly_profile"]
     F --> G[charts / analysis]
     H[GitHub Actions CI<br/>fixtures, no secrets] -.->|every PR| D
-    I[GitHub Actions nightly] -.->|EIA API -> MotherDuck| B
+    I[GitHub Actions nightly] -.->|"EIA API to MotherDuck"| B
 ```
 
 ## Quickstart
