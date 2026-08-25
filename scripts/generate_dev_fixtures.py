@@ -75,6 +75,9 @@ PROFILES: dict[str, tuple[float, float, float, str, dict[str, float]]] = {
              "OTH": 0.5, "SNB": 0.5}),
     "DUK":  (15000, 1400, 4200, "mixed", {"NG": 6.0, "NUC": 5.5, "COL": 2.5,
              "WAT": 1.0, "SUN": 1.4, "OTH": 0.4}),
+    "SOCO": (30000, 2500, 7000, "mixed", {"NG": 14.0, "NUC": 8.0, "COL": 4.0,
+             "SUN": 4.0, "WAT": 1.5, "OTH": 0.6, "OIL": 0.2, "WND": 1.0,
+             "BAT": 0.4}),
 }
 SIGNED_FUELS = {"BAT", "SNB", "UES"}
 
