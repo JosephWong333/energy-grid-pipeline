@@ -9,3 +9,4 @@ SWPP,Southwest Power Pool,Central,America/Chicago,true,true,true
 BPAT,Bonneville Power Administration,Northwest,America/Los_Angeles,false,false,true
 FPL,Florida Power & Light,Southeast,America/New_York,false,true,false
 DUK,Duke Energy Carolinas,Southeast,America/New_York,false,true,false
+SOCO,Southern Company Services,Southeast,America/New_York,false,true,true
