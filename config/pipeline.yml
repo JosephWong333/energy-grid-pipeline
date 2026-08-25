@@ -45,6 +45,7 @@ balancing_authorities:
   - BPAT   # Bonneville Power Administration
   - FPL    # Florida Power & Light
   - DUK    # Duke Energy Carolinas
+  - SOCO   # Southern Company (Georgia, Alabama)
 
 routes:
   region_data:
