@@ -6,11 +6,23 @@ name: Nightly refresh
 # Required repository secrets:
 #   EIA_API_KEY       — free key from https://www.eia.gov/opendata/register.php
 #   MOTHERDUCK_TOKEN  — from https://motherduck.com (free tier is plenty)
+#
+# Required repository variables (not secrets — none of these are sensitive,
+# and having them readable in the log is what makes an auth failure debuggable):
+#   GCP_PROJECT_ID, GCP_WIF_PROVIDER, GCP_SERVICE_ACCOUNT
+# Google auth is keyless via Workload Identity Federation. There is no service
+# account JSON anywhere in this repo or its secrets.
 
 on:
   schedule:
     - cron: "25 7 * * *"   # daily 07:25 UTC (~00:25 Pacific)
   workflow_dispatch:
+    inputs:
+      publish_mode:
+        description: "BigQuery publish: incremental (lookback window) or full (reseed every partition)"
+        type: choice
+        options: [incremental, full]
+        default: incremental
 
 concurrency:
   group: nightly-refresh
@@ -20,6 +32,13 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+
+    # id-token: write lets the runner mint the OIDC token that Google exchanges
+    # for a short-lived credential. Without it, auth fails on a missing token.
+    permissions:
+      id-token: write
+      contents: read
+
     env:
       EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
       MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
@@ -47,6 +66,32 @@ jobs:
         run: >-
           dbt build --project-dir dbt --profiles-dir dbt --target prod
           --vars '{expect_full_history: true}'
+
+      # --- serving layer -------------------------------------------------
+      # Publishing runs BEFORE source freshness on purpose. Freshness failing
+      # means EIA has not published yet upstream; it does not mean the marts
+      # are wrong. Gating the publish on it would let a quiet upstream day
+      # silently freeze BigQuery while the warehouse was perfectly fine.
+
+      - name: Authenticate to Google Cloud (keyless)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # `full` is the recovery lever, never the schedule. The incremental
+      # window is 5 days, so an outage longer than that would leave a hole in
+      # BigQuery that no later incremental run would ever revisit. Reseeding
+      # is one dispatch rather than a manual backfill script.
+      - name: Publish marts to GCS + BigQuery
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCS_BUCKET: eia-grid-930-marts
+          BQ_DATASET: energy_grid
+        run: python scripts/export_to_cloud.py --mode "${{ inputs.publish_mode || 'incremental' }}"
 
       - name: Source freshness
         run: dbt source freshness --project-dir dbt --profiles-dir dbt --target prod
