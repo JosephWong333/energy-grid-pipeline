@@ -184,7 +184,8 @@ def main() -> int:
     con = connect()
     print(f"source : {DB_PATH}")
     print(f"target : {PROJECT}:{DATASET}  <-  gs://{BUCKET}")
-    print(f"mode   : {args.mode}" + (f" (lookback {LOOKBACK_DAYS}d)" if args.mode == "incremental" else ""))
+    window = f" (lookback {LOOKBACK_DAYS}d)" if args.mode == "incremental" else ""
+    print(f"mode   : {args.mode}{window}")
     print()
 
     tmp = Path(tempfile.mkdtemp(prefix="eia-export-"))
@@ -258,7 +259,8 @@ def main() -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
     print()
-    print(f"done: {total:,} rows published" + (" (dry run, nothing changed)" if args.dry_run else ""))
+    note = " (dry run, nothing changed)" if args.dry_run else ""
+    print(f"done: {total:,} rows published{note}")
     return 0
 
 
