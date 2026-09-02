@@ -26,7 +26,7 @@ this repo or its secrets.
 
 ## Live dashboard
 
-**[Open the dashboard →](https://datastudio.google.com/reporting/3f414fc8-0ba0-45e9-a904-f280bd7ac50e)** — public, no login.
+**[Open the Data Studio dashboard →](https://datastudio.google.com/reporting/3f414fc8-0ba0-45e9-a904-f280bd7ac50e)** — public, no login.
 
 Two views on the BigQuery marts: the CISO **duck curve** (average demand vs.
 average net load by local hour — the gap between the lines is solar), and
