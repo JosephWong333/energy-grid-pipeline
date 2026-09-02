@@ -1,12 +1,13 @@
 # energy-grid-pipeline
 
 [![CI](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/ci.yml)
+[![Nightly](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/nightly.yml/badge.svg)](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/nightly.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![dbt](https://img.shields.io/badge/dbt-duckdb-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Hourly US power-grid analytics, end to end: demand, net generation, interchange,
-and fuel mix for 10 balancing authorities (CAISO, ERCOT, MISO, PJM, …), ingested
+and fuel mix for 11 balancing authorities (CAISO, ERCOT, MISO, PJM, …), ingested
 from the [EIA-930 API](https://www.eia.gov/opendata/) into DuckDB and modeled
 with dbt into tested, documented marts — renewable share, net load, the duck
 curve, peak analytics.
@@ -14,11 +15,27 @@ curve, peak analytics.
 The entire pipeline — ingestion, models, and 123 data tests — runs in CI on every
 pull request with **zero credentials**, using deterministic API-shaped fixtures
 that flow through the exact same parse-and-load path as live data. A nightly
-GitHub Actions job refreshes real data into MotherDuck.
+GitHub Actions job refreshes real data into MotherDuck, then publishes the
+finished marts to BigQuery behind a public dashboard — authenticating to Google
+with keyless Workload Identity Federation, so no service-account key exists in
+this repo or its secrets.
 
 ![Duck curve](docs/img/duck_curve.png)
 
 ![Renewable share](docs/img/renewable_share.png)
+
+## Live dashboard
+
+**[Open the dashboard →](https://datastudio.google.com/reporting/3f414fc8-0ba0-45e9-a904-f280bd7ac50e)** — public, no login.
+
+Two views on the BigQuery marts: the CISO **duck curve** (average demand vs.
+average net load by local hour — the gap between the lines is solar), and
+**renewable share by month** across all 11 balancing authorities.
+
+The nightly exports the marts to Parquet on GCS and loads them into BigQuery
+one day per partition. A reload replaces its partition wholesale, so the
+publish is idempotent for the same reason the dbt run is: re-running converges
+instead of accumulating.
 
 ## Architecture
 
@@ -30,6 +47,9 @@ flowchart LR
     D --> E[dbt intermediate<br/>pivot + categorize]
     E --> F["dbt marts<br/>fct_grid_hourly (incremental)<br/>mart_grid_daily<br/>mart_hourly_profile"]
     F --> G[charts / analysis]
+    F -.->|nightly export| J[(GCS<br/>Parquet)]
+    J -->|"bq load, one day per partition"| K[(BigQuery<br/>partitioned + clustered)]
+    K --> L[Data Studio<br/>public dashboard]
     H[GitHub Actions CI<br/>fixtures, no secrets] -.->|every PR| D
     I[GitHub Actions nightly] -.->|"EIA API to MotherDuck"| B
 ```
@@ -154,6 +174,14 @@ warehouse and runs the full test suite.
 an ideal fit for DuckDB locally and MotherDuck as a zero-ops cloud target.
 Same SQL, same dbt project, a one-line profile switch.
 
+**BigQuery as a serving layer, not a second transform engine.** DuckDB stays
+the only place models run; the nightly publishes *finished* marts so a BI tool
+can read them without a MotherDuck token. It's a copy, not a fork. Running the
+same suite on two engines that disagree on nulls-in-aggregates, integer
+division, and timestamp arithmetic would double the test surface to serve a
+table under a gigabyte. Past that size the answer is dbt-bigquery with
+cross-db macros — not this.
+
 **GitHub Actions as the orchestrator.** A daily batch with one dependency
 chain doesn't need an always-on scheduler. Cron-triggered Actions are free,
 observable, and honest about the workload. (An Airflow version of this
@@ -241,7 +269,9 @@ pattern lives in my [retail pipeline](https://github.com/JosephWong333/retail-an
   data (price spikes vs net-load ramps). Deliberately out of v1 scope: the
   OASIS API's quirks earn their own milestone.
 - Weather features (NOAA) for demand-driver analysis.
-- Evidence.dev dashboard reading straight from MotherDuck.
+- Volume-weighted renewable share — carry the numerator and denominator
+  through `mart_grid_daily`, not just the finished ratio, so monthly rollups
+  weight by generation instead of averaging daily ratios.
 
 ## Attribution
 
