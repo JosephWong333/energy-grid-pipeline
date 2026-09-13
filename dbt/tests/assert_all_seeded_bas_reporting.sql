@@ -1,10 +1,23 @@
+{{ config(severity='error', warn_if='>0', error_if='>3') }}
 -- Coverage against the SEED, not against whatever happens to be present:
 -- every seeded balancing authority must have (a) metrics within 5 days and
 -- (b) a fuel report within 7 days (fuel legitimately lags demand). A BA
 -- that is entirely absent appears here — grouping only existing rows would
 -- let a missing BA vanish from its own freshness check, and one current
--- fuel row can no longer mask nine silent routes. ERROR severity: absent
--- coverage is a real failure, not a curiosity.
+-- fuel row can no longer mask nine silent routes.
+--
+-- Severity policy: a FEW BAs with a coverage problem is an upstream
+-- availability event (a BA going dark or restating late at EIA), so it
+-- WARNS and the rest keep publishing — the marts already carry
+-- is_complete_day / is_fuel_mix_complete_day flags, so consumers can see
+-- the gap. FOUR OR MORE of the 11 seeded BAs (a third of the fleet) is an
+-- ERROR: that many independent BAs do not go dark together, so it means
+-- something is broken on our side (a watermark, a route, a facet) and the
+-- build must stop before publish. The threshold is 3, not 1, because the
+-- Sept 5 and Sept 7 2026 nightly runs each saw TWO BAs trip at once from
+-- upstream noise. Revisit if the seed grows.
+-- Context: Sept 6-12 2026, ISNE's OIL fuel group went intermittently absent
+-- at EIA, the single failing row blocked the whole publish for six nights.
 
 with per_ba as (
 
