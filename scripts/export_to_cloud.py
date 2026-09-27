@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -108,14 +109,37 @@ def _tool(name: str) -> str:
     return found
 
 
+# Every gcloud/bq call is retried. On 2026-09-23 the nightly died on the third
+# `bq load` of the run: the CLI's token refresh got "delayed connect error:
+# Connection refused" from the identity-pool exchange, a transient network
+# blip that the very next attempt would have survived. Retrying is safe because
+# every call here is idempotent: `gcloud storage cp` overwrites the same object
+# and `bq load --replace` overwrites the same table or partition.
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = (10, 30)
+
+
 def run(cmd: list[str], *, dry_run: bool) -> None:
     printable = " ".join(cmd)
     print(f"  $ {printable}", flush=True)
     if dry_run:
         return
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        sys.exit(f"error: command failed with exit {result.returncode}: {printable}")
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        result = subprocess.run(cmd)
+        if result.returncode == 0:
+            return
+        if attempt == RETRY_ATTEMPTS:
+            sys.exit(
+                f"error: command failed with exit {result.returncode} "
+                f"after {attempt} attempts: {printable}"
+            )
+        delay = RETRY_BACKOFF_SECONDS[attempt - 1]
+        print(
+            f"  retry {attempt}/{RETRY_ATTEMPTS - 1}: exit {result.returncode}, "
+            f"waiting {delay}s before attempt {attempt + 1}",
+            flush=True,
+        )
+        time.sleep(delay)
 
 
 def connect() -> duckdb.DuckDBPyConnection:
