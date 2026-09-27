@@ -6,11 +6,23 @@
 ![dbt](https://img.shields.io/badge/dbt-duckdb-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+**[Live dashboard](https://datastudio.google.com/reporting/3f414fc8-0ba0-45e9-a904-f280bd7ac50e)** · **[Model docs](https://josephwong333.github.io/energy-grid-pipeline/)** · **[Nightly runs](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/nightly.yml)**
+
 Hourly US power-grid analytics, end to end: demand, net generation, interchange,
 and fuel mix for 11 balancing authorities (CAISO, ERCOT, MISO, PJM, …), ingested
 from the [EIA-930 API](https://www.eia.gov/opendata/) into DuckDB and modeled
 with dbt into tested, documented marts — renewable share, net load, the duck
 curve, peak analytics.
+
+| At a glance | |
+|:---|:---|
+| **Coverage** | 11 US balancing authorities (CAISO, ERCOT, MISO, PJM, NYISO, ISO-NE, SPP, BPA, FPL, Duke, Southern), hourly since 2019 |
+| **Scale** | 7.7M+ raw rows → 746K+ row hourly fact table |
+| **Quality** | 123 dbt data tests + 31 unit tests on every PR, with zero credentials |
+| **Runs** | Nightly on GitHub Actions since Aug 2026: EIA → MotherDuck → BigQuery → dashboard |
+| **Security** | Keyless Google auth (Workload Identity Federation): no service-account key exists |
+| **Cost** | $0/month on free tiers |
+| **Stack** | Python · DuckDB/MotherDuck · dbt · GitHub Actions · BigQuery · GCS · Google Data Studio (formerly Looker Studio) |
 
 The entire pipeline — ingestion, models, and 123 data tests — runs in CI on every
 pull request with **zero credentials**, using deterministic API-shaped fixtures
@@ -26,7 +38,7 @@ this repo or its secrets.
 
 ## Live dashboard
 
-**[Open the Data Studio dashboard →](https://datastudio.google.com/reporting/3f414fc8-0ba0-45e9-a904-f280bd7ac50e)** — public, no login.
+**[Open the Data Studio dashboard →](https://datastudio.google.com/reporting/3f414fc8-0ba0-45e9-a904-f280bd7ac50e)** — built in Google Data Studio (formerly Looker Studio); public, no login.
 
 Two views on the BigQuery marts: the CISO **duck curve** (average demand vs.
 average net load by local hour — the gap between the lines is solar), and
@@ -53,6 +65,16 @@ flowchart LR
     H[GitHub Actions CI<br/>fixtures, no secrets] -.->|every PR| D
     I[GitHub Actions nightly] -.->|"EIA API to MotherDuck"| B
 ```
+
+## Operating it
+
+It runs unattended every night, and it has broken. What broke, and what changed:
+
+| When | What happened | What changed |
+|---|---|---|
+| Aug 31, 2026 | MotherDuck's trial expired overnight and the nightly went red | Moved to the free plan; one `publish_mode=full` run backfilled BigQuery |
+| Sept 5-12, 2026 | EIA intermittently stopped sending ISO-NE's oil-generation rows; the coverage test failed the build and blocked publishing for all 11 BAs | Coverage became graded: 1-3 BAs with gaps warn and publishing continues; 4+ fail the build, because independent operators don't go dark together |
+| Sept 23, 2026 | A network blip during the keyless token refresh killed one publish | Every gcloud/bq call now retries (up to 3 attempts; safe: every load is idempotent); the 5-day partition window had already re-published the missed day the next night |
 
 ## Quickstart
 
@@ -156,7 +178,7 @@ window at a time with a watermark advanced per window. Requests stay small,
 progress survives crashes, and re-running never duplicates.
 
 **CI without secrets.** The fixture generator writes deterministic,
-API-shaped JSON pages for **all ten configured balancing authorities**, each
+API-shaped JSON pages for **all 11 configured balancing authorities**, each
 with a distinct grid archetype (solar-heavy CISO, wind-heavy ERCO/SWPP,
 hydro-dominant BPAT, ...), local-time shapes from the seed's IANA zones via
 `zoneinfo`, and a fixed slice around the 2026-03-08 spring-forward so
@@ -180,12 +202,13 @@ can read them without a MotherDuck token. It's a copy, not a fork. Running the
 same suite on two engines that disagree on nulls-in-aggregates, integer
 division, and timestamp arithmetic would double the test surface to serve a
 table under a gigabyte. Past that size the answer is dbt-bigquery with
-cross-db macros — not this.
+cross-db macros — not this. Every `gcloud`/`bq` call retries, and each night
+re-publishes a 5-day partition window, so a failed night heals itself.
 
 **GitHub Actions as the orchestrator.** A daily batch with one dependency
 chain doesn't need an always-on scheduler. Cron-triggered Actions are free,
 observable, and honest about the workload. (An Airflow version of this
-pattern lives in my [retail pipeline](https://github.com/JosephWong333/retail-analytics-data-platform).)
+pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-modern-data-stack).)
 
 ## Testing
 
@@ -194,7 +217,7 @@ pattern lives in my [retail pipeline](https://github.com/JosephWong333/retail-an
   reconciliation, and custom `non_negative` checks scoped to unflagged rows.
   Severities are deliberate: a new fuel code *warns* (data keeps flowing
   into `other_mwh`, and it surfaces in the CI status and nightly log);
-  broken grain, lost rows, or a missing balancing authority *error*.
+  broken grain, lost rows, or four or more missing balancing authorities *error*.
 - **Two EIA-930 identity tests** (warn): `demand ≈ net_generation −
   total_interchange` and `Σ fuel ≈ net_generation`, evaluated only on
   complete, unflagged hours. Tolerances are deliberately wide sanity bands
@@ -202,11 +225,16 @@ pattern lives in my [retail pipeline](https://github.com/JosephWong333/retail-an
   is `mart_identity_residuals` — a *diagnostic* mart (nothing consumes it
   automatically yet) holding daily per-BA residual distributions, for
   tuning per-BA tolerances on evidence after the first backfill.
-- **Seed-driven coverage** (error): every *seeded* balancing authority
-  must have metrics within 5 days and a fuel report within 7. Because the
-  check runs against the seed rather than whatever rows exist, an entirely
-  absent BA fails loudly instead of vanishing from its own freshness check,
-  and one current row can't mask nine silent routes.
+- **Seed-driven coverage** (graded: 1-3 BAs warn, 4+ error): every *seeded*
+  balancing authority must have metrics within 5 days and a fuel report
+  within 7. Because the check runs against the seed rather than whatever
+  rows exist, an entirely absent BA still shows up by name instead of
+  vanishing from its own freshness check, and one current row can't mask
+  nine silent routes. One to three BAs with gaps is an upstream
+  availability event, so it warns and publishing continues (the marts
+  carry completeness flags, so the gap stays visible); four or more means
+  something is broken on our side, because independent operators don't go
+  dark together, and the build stops before publish.
 - **31 Python unit tests**: pagination (with truncation detection),
   response integrity (wrong-respondent, out-of-window, or odd-unit rows
   raise before any upsert or watermark motion),
