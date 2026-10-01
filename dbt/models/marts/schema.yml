@@ -109,7 +109,7 @@ models:
         description: A solar or wind VALUE was null this hour; net load is invalidated rather than computed with a zero stand-in.
         tests: [not_null]
       - name: has_vre_absent
-        description: Solar/wind row absent although this BA reports the group this month; net load invalidated.
+        description: Solar/wind row absent although the BA is expected to report the group (persisted expectation or seed declaration); net load invalidated.
         tests: [not_null]
       - name: has_fuel_extreme_outlier
         description: A fuel value beyond the sanity ceiling; net load and identity tests exclude the hour.
@@ -128,8 +128,9 @@ models:
   - name: mart_grid_daily
     description: >
       Daily rollup per BA with volume-weighted shares, peak analytics, and
-      anomaly counts. Anomalous hours are excluded from aggregates but
-      counted in n_anomalous_hours.
+      anomaly counts. Grid-anomalous hours are excluded from aggregates but
+      counted in n_anomalous_hours; fuel-anomalous hours are counted in
+      n_fuel_anomalous_hours and gate is_fuel_mix_complete_day.
     tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:
@@ -212,8 +213,8 @@ models:
   - name: mart_identity_residuals
     description: >
       Daily per-BA residual distributions for both EIA-930 identities.
-      The monitoring companion to the loose identity sanity tests — tune
-      per-BA tolerances from this after the first real backfill.
+      The monitoring companion to the loose identity sanity tests: the
+      evidence for tuning per-BA tolerances (not done yet).
     columns:
       - name: ba_code
         tests: [not_null]

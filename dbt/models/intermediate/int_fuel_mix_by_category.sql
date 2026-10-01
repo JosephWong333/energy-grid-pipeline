@@ -13,7 +13,7 @@
 --     seed declaration (balancing_authorities.expects_solar/expects_wind —
 --     fail-closed: it catches a whole month of missing solar, which a
 --     purely self-learned signal cannot, because the broken month would
---     teach it that absence is normal) and the month-observed signal (which
+--     teach it that absence is normal) and the persistent first-seen signal (which
 --     stays era-aware for vocabulary changes and catches gaps in BAs the
 --     seed doesn't declare). A BA the seed marks false and that never
 --     reports the group is legitimately zero.
@@ -126,7 +126,7 @@ group_first_seen as (
     -- Materiality floor: a group must be reported for a substantial slice of
     -- a month before it earns a standing expectation. MISO reported OIL for
     -- 24 hours in November 2021 and never again; without this floor that one
-    -- blip invalidated every MISO hour for the next five years.
+    -- blip invalidated MISO's fuel mix for every later hour (five years).
     select ba_code, fuel_group, min(month) as first_seen
     from month_groups
     where n_hours >= 100

@@ -29,7 +29,7 @@ jobs:
         run: ruff check .
       - name: Unit tests (pytest)
         run: pytest
-      # Full pipeline verification with ZERO credentials: deterministic,
+      # Full pipeline verification with ZERO credentials: seeded,
       # API-shaped fixtures flow through the real parse + upsert path, then
       # dbt materializes every model and runs the entire test suite.
       - name: Generate dev fixtures

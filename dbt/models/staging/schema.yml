@@ -13,8 +13,9 @@ models:
       - name: ba_code
         tests:
           - not_null
-          # warn (not error): a BA appearing in the feed before it's added to
-          # the seed shouldn't halt the pipeline — it should tell us.
+          # warn (not error): a BA added to config/pipeline.yml before its seed
+          # row shouldn't halt the pipeline — it should tell us. (Ingestion only
+          # requests configured BAs, so this is where a missing seed row shows.)
           - relationships:
               arguments:
                 to: ref('balancing_authorities')

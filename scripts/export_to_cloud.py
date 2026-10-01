@@ -73,7 +73,8 @@ class Mart:
 
     partition_field set => incremental mode loads it one day per partition.
     partition_field None => always replaced whole (these are dbt `table`
-    materializations, fully rebuilt every run, and all are under 30k rows).
+    materializations, fully rebuilt every run, and all small: about 31k rows
+    or fewer).
     """
 
     name: str

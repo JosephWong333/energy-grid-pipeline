@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/ci.yml)
 [![Nightly](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/nightly.yml/badge.svg)](https://github.com/JosephWong333/energy-grid-pipeline/actions/workflows/nightly.yml)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![dbt](https://img.shields.io/badge/dbt-duckdb-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -25,8 +25,8 @@ curve, peak analytics.
 | **Stack** | Python · DuckDB/MotherDuck · dbt · GitHub Actions · BigQuery · GCS · Google Data Studio (formerly Looker Studio) |
 
 The entire pipeline — ingestion, models, and 123 data tests — runs in CI on every
-pull request with **zero credentials**, using deterministic API-shaped fixtures
-that flow through the exact same parse-and-load path as live data. A nightly
+pull request with **zero credentials**, using seeded, API-shaped fixtures
+that go through the same parser and upsert code as live data. A nightly
 GitHub Actions job refreshes real data into MotherDuck, then publishes the
 finished marts to BigQuery behind a public dashboard — authenticating to Google
 with keyless Workload Identity Federation, so no service-account key exists in
@@ -40,14 +40,16 @@ this repo or its secrets.
 
 **[Open the Data Studio dashboard →](https://datastudio.google.com/reporting/3f414fc8-0ba0-45e9-a904-f280bd7ac50e)** — built in Google Data Studio (formerly Looker Studio); public, no login.
 
-Two views on the BigQuery marts: the CISO **duck curve** (average demand vs.
-average net load by local hour — the gap between the lines is solar), and
-**renewable share by month** across all 11 balancing authorities.
+Two views on the BigQuery marts: the CAISO (`CISO`) **duck curve** (average
+demand vs. average net load by local hour — the gap between the lines is wind
+plus solar), and **renewable share by month** across all 11 balancing
+authorities.
 
-The nightly exports the marts to Parquet on GCS and loads them into BigQuery
-one day per partition. A reload replaces its partition wholesale, so the
-publish is idempotent for the same reason the dbt run is: re-running converges
-instead of accumulating.
+The nightly exports the four marts to Parquet on GCS and loads them into
+BigQuery: the hourly fact one day per partition (the last 5 days each night),
+the three small marts as whole-table replaces. Every load replaces its target,
+so the publish is idempotent for the same reason the dbt run is: re-running
+converges instead of accumulating.
 
 ## Architecture
 
@@ -57,12 +59,12 @@ flowchart LR
     B -->|idempotent upserts| C[(DuckDB<br/>raw schema)]
     C --> D[dbt staging<br/>type + flag]
     D --> E[dbt intermediate<br/>pivot + categorize]
-    E --> F["dbt marts<br/>fct_grid_hourly (incremental)<br/>mart_grid_daily<br/>mart_hourly_profile"]
+    E --> F["dbt marts<br/>fct_grid_hourly (incremental)<br/>mart_grid_daily<br/>mart_hourly_profile<br/>mart_identity_residuals"]
     F --> G[charts / analysis]
     F -.->|nightly export| J[(GCS<br/>Parquet)]
-    J -->|"bq load, one day per partition"| K[(BigQuery<br/>partitioned + clustered)]
+    J -->|"bq load, one day per partition"| K[(BigQuery<br/>fact partitioned + clustered)]
     K --> L[Data Studio<br/>public dashboard]
-    H[GitHub Actions CI<br/>fixtures, no secrets] -.->|every PR| D
+    H[GitHub Actions CI<br/>fixtures, no secrets] -.->|every PR| B
     I[GitHub Actions nightly] -.->|"EIA API to MotherDuck"| B
 ```
 
@@ -77,6 +79,8 @@ It runs unattended every night, and it has broken. What broke, and what changed:
 | Sept 23, 2026 | A network blip during the keyless token refresh killed one publish | Every gcloud/bq call now retries (up to 3 attempts; safe: every load is idempotent); the 5-day partition window had already re-published the missed day the next night |
 
 ## Quickstart
+
+Commands assume Linux or macOS (on Windows, use Git Bash or WSL).
 
 **No API key needed** — run the whole thing on synthetic fixtures first:
 
@@ -94,9 +98,9 @@ make dev        # fixtures -> ingest -> dbt build (123 tests) -> charts, all on 
 cp .env.example .env          # paste your key from eia.gov/opendata/register.php
 
 # Pilot first, on a THROWAWAY database — prove the key and the API behave
-# before committing to hours of backfill. Replay never writes watermarks,
+# before committing to a full backfill. Replay never writes watermarks,
 # and the pilot db is deleted, so nothing about this can poison the real run:
-GRID_DB_PATH=data/pilot.duckdb python -m grid_pipeline.ingest --mode backfill --replay-since $(date -d '7 days ago' +%F)
+GRID_DB_PATH=data/pilot.duckdb python -m grid_pipeline.ingest --mode backfill --replay-since $(python -c "import datetime as d; print(d.date.today() - d.timedelta(days=7))")
 rm data/pilot.duckdb
 
 make backfill                 # full history since 2019 (resumable; typically
@@ -108,7 +112,9 @@ make charts                   # regenerates README charts from live data
 
 Daily refresh afterwards is `make incremental` (raw ingest *and* a mart
 rebuild; `make incremental-raw` for ingest-only) — or let the nightly GitHub
-Action do it (see `.github/workflows/nightly.yml` for the two required secrets).
+Action do it (see `.github/workflows/nightly.yml` for the two required secrets
+and three repository variables; publishing also needs a GCP project with
+Workload Identity Federation and a GCS bucket).
 
 **One-time cloud setup for the nightly run.** The prod target connects with
 `md:energy_grid`, which *attaches* an existing MotherDuck database — it will
@@ -130,7 +136,7 @@ silently spawn an empty database.)
 | `raw` | `eia_region_data`, `eia_fuel_mix` | Landed by Python with PKs on natural grain; `INSERT OR REPLACE` makes every load idempotent |
 | staging | `stg_eia__grid_metrics`, `stg_eia__fuel_mix` | Rename, type, and **flag** quality issues (never drop) |
 | intermediate | `int_grid_metrics_pivoted`, `int_fuel_mix_by_category` | Long→wide pivot; fuel categorization with renewable vs carbon-free totals |
-| marts | `fct_grid_hourly` (incremental), `mart_grid_daily`, `mart_hourly_profile` | One row per BA-hour with net load + shares; daily rollups; average hourly shapes |
+| marts | `fct_grid_hourly` (incremental), `mart_grid_daily`, `mart_hourly_profile`, `mart_identity_residuals` | One row per BA-hour with net load + shares; daily rollups; average hourly shapes; daily identity residuals (diagnostic) |
 
 Key mart columns: `net_load_mwh` (demand − wind − solar; the duck-curve
 metric), `renewable_share` vs `carbon_free_share` (nuclear counts in the
@@ -170,23 +176,24 @@ ingestion; deriving local enables the analyses that actually need wall time
 **Flag, don't drop.** Real EIA data contains negative-demand glitches, missing
 hours, and nulls. Staging preserves every row and attaches boolean quality
 flags; marts decide their own policy (daily aggregates exclude flagged hours
-*and* count them). A test enforces that every negative value is flagged — the
-flag logic itself is under test.
+*and* count them). A test enforces that every negative demand or
+net-generation value is flagged — the flag logic itself is under test.
 
 **Month-windowed, resumable backfill.** History loads one (route, BA, month)
 window at a time with a watermark advanced per window. Requests stay small,
 progress survives crashes, and re-running never duplicates.
 
-**CI without secrets.** The fixture generator writes deterministic,
+**CI without secrets.** The fixture generator writes seeded,
 API-shaped JSON pages for **all 11 configured balancing authorities**, each
 with a distinct grid archetype (solar-heavy CISO, wind-heavy ERCO/SWPP,
 hydro-dominant BPAT, ...), local-time shapes from the seed's IANA zones via
-`zoneinfo`, and a fixed slice around the 2026-03-08 spring-forward so
-DST-exact completeness is exercised in every CI run. Planted quirks mirror
-the live feed: string/null values, a negative-demand hour, an absent fuel
-report, an absent-solar hour, a missing demand row, and a 600 GWh fuel
-outlier. They ingest through the exact production parse/upsert path into a
-separate warehouse (`data/dev_fixtures.duckdb`) — synthetic and real data never share a
+`zoneinfo`, and fixed slices around the 2026-03-08 spring-forward and the
+2025-11-02 fall-back, so DST-exact completeness (23- and 25-hour days) is
+exercised in every CI run. Planted quirks mirror the live feed: string/null
+values, a negative-demand hour, an absent fuel report, an absent-solar hour,
+a missing demand row, a 600 GWh fuel outlier, and an unverifiable hour (400
+GWh of demand with its generation row missing). They go through the same
+parser and upsert code as live data, into a separate warehouse (`data/dev_fixtures.duckdb`) — synthetic and real data never share a
 database file, the ingester refuses to cross the streams, every raw row
 carries `_source` lineage, and charts fail closed to a watermark unless
 row-level provenance proves the data real. Every PR builds the entire
@@ -199,11 +206,12 @@ Same SQL, same dbt project, a one-line profile switch.
 **BigQuery as a serving layer, not a second transform engine.** DuckDB stays
 the only place models run; the nightly publishes *finished* marts so a BI tool
 can read them without a MotherDuck token. It's a copy, not a fork. Running the
-same suite on two engines that disagree on nulls-in-aggregates, integer
-division, and timestamp arithmetic would double the test surface to serve a
-table under a gigabyte. Past that size the answer is dbt-bigquery with
-cross-db macros — not this. Every `gcloud`/`bq` call retries, and each night
-re-publishes a 5-day partition window, so a failed night heals itself.
+same suite on two SQL dialects that differ on timestamp types, interval
+syntax and function names would double the test surface to serve a table
+under a gigabyte. Past that size the answer is dbt-bigquery with
+cross-db macros — not this. Every `gcloud`/`bq` call gets up to 3 attempts,
+and each night re-publishes a 5-day partition window, so a failed night heals
+itself.
 
 **GitHub Actions as the orchestrator.** A daily batch with one dependency
 chain doesn't need an always-on scheduler. Cron-triggered Actions are free,
@@ -216,32 +224,35 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
   accepted ranges, relationship integrity, a symmetric fact↔source
   reconciliation, and custom `non_negative` checks scoped to unflagged rows.
   Severities are deliberate: a new fuel code *warns* (data keeps flowing
-  into `other_mwh`, and it surfaces in the CI status and nightly log);
-  broken grain, lost rows, or four or more missing balancing authorities *error*.
+  into `other_mwh`, and it shows up as a WARN in the CI and nightly logs);
+  broken grain, lost rows, or four or more balancing authorities with
+  coverage gaps *error*.
 - **Two EIA-930 identity tests** (warn): `demand ≈ net_generation −
   total_interchange` and `Σ fuel ≈ net_generation`, evaluated only on
   complete, unflagged hours. Tolerances are deliberately wide sanity bands
   (live BA reporting doesn't reconcile tightly); the observability surface
   is `mart_identity_residuals` — a *diagnostic* mart (nothing consumes it
   automatically yet) holding daily per-BA residual distributions, for
-  tuning per-BA tolerances on evidence after the first backfill.
+  tuning per-BA tolerances on evidence (not done yet; the bands are still
+  global).
 - **Seed-driven coverage** (graded: 1-3 BAs warn, 4+ error): every *seeded*
-  balancing authority must have metrics within 5 days and a fuel report
-  within 7. Because the check runs against the seed rather than whatever
-  rows exist, an entirely absent BA still shows up by name instead of
-  vanishing from its own freshness check, and one current row can't mask
-  nine silent routes. One to three BAs with gaps is an upstream
-  availability event, so it warns and publishing continues (the marts
-  carry completeness flags, so the gap stays visible); four or more means
-  something is broken on our side, because independent operators don't go
-  dark together, and the build stops before publish.
+  balancing authority must have metrics within 5 days, a fuel report within
+  7, and at least 20 usable hours (fuel reported, valid net load, valid fuel
+  mix) in the last 72. Because the check runs against the seed rather than
+  whatever rows exist, an entirely absent BA still shows up by name instead
+  of vanishing from its own freshness check, and one fresh BA can't mask
+  the others going silent. One to three BAs with gaps is usually an
+  upstream availability event, so it warns and publishing continues (the
+  marts carry completeness flags, so the gap stays visible); four or more
+  usually means something is broken on our side, because independent
+  operators don't go dark together, and the build stops before publish.
 - **31 Python unit tests**: pagination (with truncation detection),
   response integrity (wrong-respondent, out-of-window, or odd-unit rows
   raise before any upsert or watermark motion),
   per-request throttling, replay/watermark semantics (a short pilot can
   never poison a backfill; watermarks are monotonic by construction),
   retry/backoff (honoring *and capping*
-  `Retry-After`), type coercion against a recorded API response, idempotent
+  `Retry-After`), type coercion against an API-shaped sample response, idempotent
   upserts, watermark round-trips, window construction, and regression tests
   for the fixture/real contamination guards and fail-closed provenance.
 - **Source freshness** SLAs on raw tables (warn 36h / error 96h), checked
@@ -285,7 +296,9 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
   operator's market time, which per PUDL's EIA-930 notes does not always
   match a BA's physical geography.
 - Fuel codes EIA adds in the future roll into `other_mwh` and trip a
-  warn-level test rather than breaking the pipeline.
+  warn-level test. They also mark that BA's fuel mix invalid, so a new code
+  appearing at four or more BAs at once fails the coverage test and holds
+  the publish until the `fuel_types` seed is updated.
 - Warehouses created before row-level lineage existed classify as `unknown`
   provenance; real ingestion modes refuse them by design. Upgrading means
   deleting the old file and backfilling clean — provenance can't be
@@ -316,7 +329,8 @@ EIA data is in the public domain. MIT licensed.
   BA-relative bound (no single fuel group may exceed 3x the hour's own net
   generation) on top of the global unit-error ceiling. Tightening to
   deviation-from-rolling-median per BA is a refinement to tune from
-  `mart_identity_residuals` after real history exists.
-- **Alerting**: warn-level tests and the residuals mart leave evidence in
-  logs; nothing pages a human. Wiring a consumer (workflow summary,
+  `mart_identity_residuals` now that real history exists (not done yet).
+- **Alerting**: warn-level tests leave evidence in logs and nothing reads
+  the residuals mart automatically; beyond GitHub's failure emails, nothing
+  pages a human. Wiring a consumer (workflow summary,
   threshold job) is the next operational step.

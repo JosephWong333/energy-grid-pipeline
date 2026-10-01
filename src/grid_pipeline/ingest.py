@@ -10,8 +10,10 @@ incremental  Per (route, BA): if a watermark exists, re-fetch a trailing
              bootstrap that pair with the same resumable month windows a
              backfill uses. First runs against an empty prod warehouse are
              therefore just as crash-safe as a local backfill.
-fixtures     Load deterministic synthetic pages through the REAL parse and
-             upsert path — used by CI and local dev.
+fixtures     Load seeded synthetic pages through the REAL parse and
+             upsert code — used by CI and local dev. (It skips the HTTP
+             client and the per-window response checks, which pytest
+             covers with stubbed sessions.)
 
 Contamination guards
 --------------------
