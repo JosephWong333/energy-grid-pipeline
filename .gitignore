@@ -5,6 +5,7 @@
 data/*.duckdb
 data/*.duckdb.wal
 data/sample/
+data/charts/
 
 # dbt artifacts
 dbt/target/

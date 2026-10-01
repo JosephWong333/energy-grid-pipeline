@@ -24,11 +24,30 @@ BigQuery partition key is `local_date`, which is wall-clock in each BA's own
 timezone. Up to 8 hours of skew (CISO is UTC-7/8) can push a restated UTC hour
 into an earlier local date, so the window gets one extra day of slack.
 
+The window is anchored on the newest local_date across ALL BAs, so on its own
+it misses older days that changed: a BA that lagged and caught up, or fuel
+that landed days after its demand. Each incremental run therefore also
+re-sends any older partition holding a row that ingest wrote in the last
+TOUCHED_SINCE_HOURS. On a normal night that adds zero or one partition.
+After a replay or a long catch-up it could be hundreds, one load job each,
+so past MAX_TOUCHED_PARTITIONS the mart gets one full replace instead.
+
+GUARDS
+The defaults point at the production project, dataset and bucket, so a stray
+local run could overwrite public tables with fixture or stale laptop data (in
+full mode, the whole fact table). A real run therefore refuses any warehouse
+whose rows are not all from the EIA API, and any local warehouse unless
+--allow-local is passed. --dry-run needs no Cloud SDK and changes nothing; CI
+runs it in both modes on every PR.
+
 SCHEMA
 There is no hand-written BigQuery DDL. The table is created by its first load
 directly from the Parquet footer, with partitioning and clustering applied at
 creation. A new column in a dbt model therefore propagates on the next full
 load instead of silently mismatching a 43-column schema file that drifted.
+Partition loads can't add columns, so after changing fct_grid_hourly's
+columns, dispatch the nightly once with dbt_full_refresh=true (which also
+publishes in full).
 
 Two casts are applied on the way out, because DuckDB's naked TIMESTAMP has no
 zone and lands in BigQuery as DATETIME:
@@ -43,6 +62,7 @@ Usage:
     python -m scripts.export_to_cloud --mode full          # seed / after a new BA
     python -m scripts.export_to_cloud --mode incremental   # nightly
     python -m scripts.export_to_cloud --mode incremental --dry-run
+    python -m scripts.export_to_cloud --mode full --allow-local   # rare: local source
 """
 
 from __future__ import annotations
@@ -60,11 +80,23 @@ from pathlib import Path
 
 import duckdb
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from grid_pipeline.provenance import data_provenance  # noqa: E402
+
 PROJECT = os.environ.get("GCP_PROJECT_ID", "eia-grid-930")
 BUCKET = os.environ.get("GCS_BUCKET", "eia-grid-930-marts")
 DATASET = os.environ.get("BQ_DATASET", "energy_grid")
 DB_PATH = os.environ.get("GRID_DB_PATH", "data/energy_grid.duckdb")
 LOOKBACK_DAYS = int(os.environ.get("EXPORT_LOOKBACK_DAYS", "5"))
+# Older partitions holding rows ingested this recently are re-sent too. 48h
+# covers tonight's ingest plus one failed publish; after two or more nights
+# without a successful publish, dispatch publish_mode=full.
+TOUCHED_SINCE_HOURS = 48
+# Past this many older partitions, one whole-table load beats N per-day jobs
+# (and keeps the nightly well inside its 90-minute timeout).
+MAX_TOUCHED_PARTITIONS = 31
 
 
 @dataclass(frozen=True)
@@ -143,10 +175,59 @@ def run(cmd: list[str], *, dry_run: bool) -> None:
         time.sleep(delay)
 
 
+def is_cloud_path(db_path: str) -> bool:
+    return db_path.lower().startswith(("md:", "motherduck:"))
+
+
+def refuse_unsafe_source(
+    con: duckdb.DuckDBPyConnection, db_path: str, *, dry_run: bool, allow_local: bool
+) -> None:
+    """Only real EIA data from the prod warehouse may reach the public tables."""
+    if dry_run:
+        return
+    verdict = data_provenance(con)
+    if verdict != "real":
+        sys.exit(
+            f"error: refusing to publish {verdict} data from {db_path}: only a "
+            "warehouse whose every raw row came from the EIA API is publishable."
+        )
+    if not is_cloud_path(db_path) and not allow_local:
+        sys.exit(
+            f"error: refusing to publish from a local warehouse ({db_path}); the "
+            "nightly publishes from md:energy_grid. Pass --allow-local if you mean it."
+        )
+
+
+def touched_partitions(
+    con: duckdb.DuckDBPyConnection, mart: Mart, before: date
+) -> list[date]:
+    """Partitions older than `before` holding a row ingested recently."""
+    field = mart.partition_field
+    rows = con.execute(
+        f"""
+        select distinct f.{field}
+        from main.{mart.name} f
+        join (
+            select respondent, period_utc from raw.eia_region_data
+            where _ingested_at >= timezone('UTC', now())
+                - interval {TOUCHED_SINCE_HOURS} hour
+            union
+            select respondent, period_utc from raw.eia_fuel_mix
+            where _ingested_at >= timezone('UTC', now())
+                - interval {TOUCHED_SINCE_HOURS} hour
+        ) r
+            on f.ba_code = r.respondent and f.period_utc = r.period_utc
+        where f.{field} < date '{before}'
+        order by 1
+        """
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def connect() -> duckdb.DuckDBPyConnection:
     # MotherDuck picks up MOTHERDUCK_TOKEN from the environment. read_only is
     # only meaningful (and only safe) for a local file.
-    if DB_PATH.startswith("md:"):
+    if is_cloud_path(DB_PATH):
         return duckdb.connect(DB_PATH)
     if not Path(DB_PATH).exists():
         sys.exit(f"error: DuckDB file not found: {DB_PATH}")
@@ -175,10 +256,12 @@ def publish(
     dry_run: bool,
 ) -> None:
     uri = f"gs://{BUCKET}/{gcs_key}"
-    run([_tool("gcloud"), "storage", "cp", str(local), uri], dry_run=dry_run)
+    # A dry run only prints, so it must not need the Cloud SDK installed.
+    tool = (lambda name: name) if dry_run else _tool
+    run([tool("gcloud"), "storage", "cp", str(local), uri], dry_run=dry_run)
     run(
         [
-            _tool("bq"),
+            tool("bq"),
             f"--project_id={PROJECT}",
             "load",
             "--source_format=PARQUET",
@@ -196,6 +279,8 @@ def main() -> int:
     ap.add_argument("--mode", choices=("full", "incremental"), default="incremental")
     ap.add_argument("--dry-run", action="store_true", help="print commands, change nothing")
     ap.add_argument("--tables", nargs="*", help="restrict to these mart names")
+    ap.add_argument("--allow-local", action="store_true",
+                    help="allow publishing from a local DuckDB file (default: refuse)")
     args = ap.parse_args()
 
     marts = MARTS
@@ -207,6 +292,7 @@ def main() -> int:
         marts = tuple(m for m in MARTS if m.name in args.tables)
 
     con = connect()
+    refuse_unsafe_source(con, DB_PATH, dry_run=args.dry_run, allow_local=args.allow_local)
     print(f"source : {DB_PATH}")
     print(f"target : {PROJECT}:{DATASET}  <-  gs://{BUCKET}")
     window = f" (lookback {LOOKBACK_DAYS}d)" if args.mode == "incremental" else ""
@@ -218,6 +304,20 @@ def main() -> int:
     try:
         for mart in marts:
             incremental = args.mode == "incremental" and mart.partition_field
+            if incremental:
+                field = mart.partition_field
+                max_date = con.execute(
+                    f"select max({field}) from main.{mart.name}").fetchone()[0]
+                if max_date is None:
+                    print(f"{mart.name}: empty, skipped")
+                    continue
+                start: date = max_date - timedelta(days=LOOKBACK_DAYS - 1)
+                older = touched_partitions(con, mart, start)
+                if len(older) > MAX_TOUCHED_PARTITIONS:
+                    print(f"{mart.name}: {len(older)} older partitions touched by "
+                          "recent ingests (a replay or long catch-up); one full "
+                          "replace instead")
+                    incremental = False
 
             if not incremental:
                 # Whole table, one file, one load job. For the fact this is the
@@ -248,22 +348,16 @@ def main() -> int:
                 total += n
                 continue
 
-            field = mart.partition_field
-            max_date = con.execute(f"select max({field}) from main.{mart.name}").fetchone()[0]
-            if max_date is None:
-                print(f"{mart.name}: empty, skipped")
-                continue
-            start: date = max_date - timedelta(days=LOOKBACK_DAYS - 1)
-            print(f"{mart.name}: partitions {start} .. {max_date}")
+            window = [start + timedelta(days=d) for d in range((max_date - start).days + 1)]
+            extra = f" + {len(older)} older, touched by recent ingests" if older else ""
+            print(f"{mart.name}: partitions {start} .. {max_date}{extra}")
 
-            day = start
-            while day <= max_date:
+            for day in older + window:
                 stamp = day.strftime("%Y%m%d")
                 local = tmp / f"{mart.name}-{stamp}.parquet"
                 n = export_parquet(con, mart, f" where {field} = date '{day}'", local)
                 if n == 0:
                     print(f"  {day}: no rows, skipped")
-                    day += timedelta(days=1)
                     continue
                 print(f"  {day}: {n:,} rows")
                 # No --time_partitioning_field here: the decorator names the
@@ -278,7 +372,6 @@ def main() -> int:
                     dry_run=args.dry_run,
                 )
                 total += n
-                day += timedelta(days=1)
     finally:
         con.close()
         shutil.rmtree(tmp, ignore_errors=True)

@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+# CI only reads the repo; the token gets nothing more.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -17,10 +21,13 @@ jobs:
       GRID_DB_PATH: data/dev_fixtures.duckdb
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.lock
       - name: Install
         run: |
           pip install -r requirements.lock
@@ -46,3 +53,10 @@ jobs:
         run: dbt build --project-dir dbt --profiles-dir dbt --target ci
       - name: Render charts (smoke test)
         run: python scripts/make_charts.py
+      # The publish script otherwise only runs in the nightly. Dry-run both
+      # modes here so a broken projection or a renamed column fails the PR,
+      # not the next night. No Cloud SDK or credentials needed.
+      - name: Publish script (dry run)
+        run: |
+          python scripts/export_to_cloud.py --mode incremental --dry-run
+          python scripts/export_to_cloud.py --mode full --dry-run

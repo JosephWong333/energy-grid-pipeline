@@ -9,10 +9,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Read-only by default. Only the deploy job (below) can write to Pages or
+# mint an OIDC token; the build job runs pip and dbt and gets neither.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -21,13 +21,17 @@ concurrency:
 jobs:
   build-docs:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.lock
 
       - name: Install
         run: |
@@ -58,6 +62,10 @@ jobs:
   deploy:
     needs: build-docs
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

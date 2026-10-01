@@ -37,12 +37,17 @@ class PipelineConfig:
 
 def load_config(path: Path | None = None) -> PipelineConfig:
     """Read pipeline.yml, applying environment overrides where they exist."""
-    load_dotenv(REPO_ROOT / ".env")
-    raw = yaml.safe_load((path or DEFAULT_CONFIG_PATH).read_text())
+    # utf-8-sig: tolerate a BOM (Windows PowerShell 5.1 writes one), which
+    # would otherwise hide whatever variable sits on the first line.
+    load_dotenv(REPO_ROOT / ".env", encoding="utf-8-sig")
+    # Explicit UTF-8: the default is the Windows code page, and the config
+    # contains non-ASCII text that cp932/cp936-style locales can't decode.
+    raw = yaml.safe_load((path or DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
 
     eia = raw["eia"]
     return PipelineConfig(
-        db_path=os.environ.get("GRID_DB_PATH", raw["database"]["path"]),
+        # `or`, not a default: an empty GRID_DB_PATH= means "unset".
+        db_path=os.environ.get("GRID_DB_PATH") or raw["database"]["path"],
         eia=EIASettings(
             base_url=eia["base_url"],
             page_size=int(eia["page_size"]),

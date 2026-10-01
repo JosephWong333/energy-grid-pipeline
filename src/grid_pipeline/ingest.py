@@ -7,9 +7,11 @@ backfill     Full history from config start, one (route, BA, month) window
              resumes at the last finished month.
 incremental  Per (route, BA): if a watermark exists, re-fetch a trailing
              lookback window (EIA restates recent hours); if none exists,
-             bootstrap that pair with the same resumable month windows a
-             backfill uses. First runs against an empty prod warehouse are
-             therefore just as crash-safe as a local backfill.
+             bootstrap that pair from the configured start. A normal night
+             is one request. A range longer than a month (a bootstrap, or
+             a catch-up after a long outage) is walked in the same
+             resumable month windows a backfill uses, so it is as
+             crash-safe as a local backfill.
 fixtures     Load seeded synthetic pages through the REAL parse and
              upsert code — used by CI and local dev. (It skips the HTTP
              client and the per-window response checks, which pytest
@@ -42,6 +44,8 @@ from .provenance import SOURCE_API, SOURCE_FIXTURES, data_provenance
 log = logging.getLogger("grid_pipeline.ingest")
 
 FIXTURES_DB_DEFAULT = "data/dev_fixtures.duckdb"
+# Longer incremental ranges are fetched in month windows, like a backfill.
+MAX_SINGLE_REQUEST_SPAN = timedelta(days=31)
 FIXTURE_PAGES_DIR = REPO_ROOT / "data" / "sample"
 
 
@@ -84,10 +88,15 @@ def resolve_db_path(mode: str, cfg) -> str:
     return str(REPO_ROOT / cfg.db_path)
 
 
+def is_cloud_path(db_path: str) -> bool:
+    """DuckDB sends 'md:', 'MD:' and 'motherduck:' paths alike to MotherDuck."""
+    return db_path.lower().startswith(("md:", "motherduck:"))
+
+
 def guard_against_contamination(con, mode: str, db_path: str) -> None:
     verdict = data_provenance(con)
     if mode == "fixtures":
-        if db_path.startswith("md:"):
+        if is_cloud_path(db_path):
             raise ContaminationError(
                 "Refusing to load fixtures into a MotherDuck/cloud warehouse "
                 f"({db_path}). Fixtures belong in a local dev database."
@@ -218,16 +227,20 @@ def run_incremental(cfg, con, client) -> None:
         for ba in cfg.balancing_authorities:
             wm = db.get_watermark(con, route["key"], ba)
             if wm is None:
-                # Never-loaded pair: bootstrap with resumable month windows,
-                # exactly like a backfill, instead of one fragile giant range.
                 log.info("%s/%s has no watermark — bootstrapping full history",
                          route["key"], ba)
-                for w_start, w_end in _month_windows(backfill_start, now):
-                    total += _load_window(con, client, route, ba, w_start, w_end,
-                                          SOURCE_API)
-                continue
-            start = wm - lookback
-            total += _load_window(con, client, route, ba, start, now, SOURCE_API)
+            # A normal night is one request, [wm - lookback, now]. A range
+            # longer than a month (a new pair, or a catch-up after a long
+            # outage) walks month windows instead of one fragile giant range,
+            # and a crash keeps every finished month.
+            start = backfill_start if wm is None else wm - lookback
+            if now - start > MAX_SINGLE_REQUEST_SPAN:
+                windows = list(_month_windows(start, now))
+            else:
+                windows = [(start, now)]
+            for w_start, w_end in windows:
+                total += _load_window(con, client, route, ba, w_start, w_end,
+                                      SOURCE_API)
     db.set_load_meta(con, "source", SOURCE_API)
     db.set_load_meta(con, "last_incremental_at", datetime.now(UTC).isoformat())
     log.info("Incremental complete: %d rows upserted", total)
@@ -284,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config()
     db_path = resolve_db_path(args.mode, cfg)
-    if not db_path.startswith("md:"):
+    if not is_cloud_path(db_path):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     con = db.connect(db_path)
     try:

@@ -60,9 +60,10 @@ models:
         description: >
           Renewable / total reported generation. The [0,1] invariant only
           holds when no signed fuel is charging — battery/pumped storage
-          land in storage_mwh, but hybrid solar/wind-with-battery (SNB/WNB)
-          charge INTO the solar and wind groups, so all three are scoped;
-          warn severity because floating-point summation can graze the
+          land in storage_mwh, hybrid solar/wind-with-battery (SNB/WNB)
+          charge INTO the solar and wind groups, and CAISO reports its
+          batteries in OTH (other_mwh), so all four are scoped; warn
+          severity because floating-point summation can graze the
           boundaries.
         tests:
           - dbt_utils.accepted_range:
@@ -72,7 +73,7 @@ models:
                 inclusive: true
               config:
                 severity: warn
-                where: "coalesce(storage_mwh, 0) >= 0 and coalesce(solar_mwh, 0) >= 0 and coalesce(wind_mwh, 0) >= 0"
+                where: "coalesce(storage_mwh, 0) >= 0 and coalesce(other_mwh, 0) >= 0 and coalesce(solar_mwh, 0) >= 0 and coalesce(wind_mwh, 0) >= 0"
       - name: carbon_free_share
         description: >
           Carbon-free (renewables + nuclear) / total reported generation.
@@ -85,7 +86,7 @@ models:
                 inclusive: true
               config:
                 severity: warn
-                where: "coalesce(storage_mwh, 0) >= 0 and coalesce(solar_mwh, 0) >= 0 and coalesce(wind_mwh, 0) >= 0"
+                where: "coalesce(storage_mwh, 0) >= 0 and coalesce(other_mwh, 0) >= 0 and coalesce(solar_mwh, 0) >= 0 and coalesce(wind_mwh, 0) >= 0"
       - name: has_grid_implausible_value
         description: The identity was evaluated and failed the 50% band (5 GWh floor) — proven-bad data, as opposed to unverifiable.
         tests: [not_null]

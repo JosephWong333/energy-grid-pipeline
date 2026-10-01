@@ -28,7 +28,8 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -40,8 +41,26 @@ TRANSPORT_ERRORS = (
     requests.Timeout,
     requests.ConnectionError,
     requests.exceptions.ChunkedEncodingError,
-    ValueError,  # resp.json() decode failures
+    # resp.json() decode failures only. A bare ValueError would also catch
+    # requests' InvalidURL/MissingSchema and burn every retry on a typo.
+    requests.exceptions.JSONDecodeError,
 )
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Retry-After is either delta-seconds or an HTTP-date (RFC 9110)."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.replace(".", "", 1).isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 # EIA hourly periods look like "2024-06-01T13" (UTC, hour precision).
 PERIOD_FORMAT = "%Y-%m-%dT%H"
@@ -81,14 +100,21 @@ def parse_row(record: dict[str, Any], series_key: str) -> EIARow:
     """Convert one raw API record into a typed EIARow.
 
     `series_key` is 'type' for region-data and 'fueltype' for fuel-type-data.
+    A malformed record raises EIAError (exit 4, resumable) instead of a
+    bare traceback.
     """
-    return EIARow(
-        period_utc=datetime.strptime(record["period"], PERIOD_FORMAT),
-        respondent=str(record["respondent"]),
-        series=str(record[series_key]),
-        value=_coerce_float(record.get("value")),
-        units=str(record.get("value-units") or ""),
-    )
+    try:
+        return EIARow(
+            period_utc=datetime.strptime(record["period"], PERIOD_FORMAT),
+            respondent=str(record["respondent"]),
+            series=str(record[series_key]),
+            value=_coerce_float(record.get("value")),
+            units=str(record.get("value-units") or ""),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise EIAError(
+            f"Malformed EIA record ({type(exc).__name__}: {exc}): {str(record)[:300]}"
+        ) from exc
 
 
 class EIAClient:
@@ -122,6 +148,10 @@ class EIAClient:
     # ------------------------------------------------------------------ #
     # HTTP layer
     # ------------------------------------------------------------------ #
+    def _redact(self, text: str) -> str:
+        """Error text can echo the request back; never let it carry the key."""
+        return text.replace(self.api_key, "***") if self.api_key else text
+
     def _throttle(self) -> None:
         """Enforce a minimum interval before EVERY request, across queries."""
         if self._last_request_at is not None:
@@ -142,10 +172,12 @@ class EIAClient:
             try:
                 resp = self.session.get(url, params=merged, timeout=self.timeout)
                 if resp.status_code == 200:
-                    body = resp.json()  # may raise ValueError -> retried
+                    body = resp.json()  # may raise JSONDecodeError -> retried
                     if "response" not in body:
                         # v2 reports request-level errors inside a 200 sometimes.
-                        raise EIAError(f"Unexpected EIA payload for {route}: {body}")
+                        raise EIAError(
+                            f"Unexpected EIA payload for {route}: "
+                            f"{self._redact(str(body))[:500]}")
                     return body
             except TRANSPORT_ERRORS as exc:
                 wait = self.backoff_base_seconds * (2**attempt)
@@ -154,13 +186,13 @@ class EIAClient:
                     "Transport error on %s (attempt %d/%d): %s — retrying in %.1fs",
                     route, attempt + 1, self.max_retries, last_error, wait,
                 )
-                self._sleep(wait)
+                if attempt < self.max_retries - 1:  # no point sleeping after the last try
+                    self._sleep(wait)
                 continue
 
             if resp.status_code in RETRYABLE_STATUS:
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after and retry_after.replace(".", "", 1).isdigit():
-                    wait = float(retry_after)
+                wait = _retry_after_seconds(resp.headers.get("Retry-After"))
+                if wait is not None:
                     if wait > self.max_retry_after_seconds:
                         raise ThrottledError(
                             f"EIA asked us to wait {wait:.0f}s (Retry-After) on "
@@ -174,14 +206,17 @@ class EIAClient:
                     "EIA %s on %s (attempt %d/%d) — retrying in %.1fs",
                     resp.status_code, route, attempt + 1, self.max_retries, wait,
                 )
-                self._sleep(wait)
+                if attempt < self.max_retries - 1:
+                    self._sleep(wait)
                 continue
 
             raise EIAError(
-                f"EIA API error {resp.status_code} on {route}: {resp.text[:500]}"
+                f"EIA API error {resp.status_code} on {route}: "
+                f"{self._redact(resp.text)[:500]}"
             )
 
-        raise EIAError(f"EIA API still failing after {self.max_retries} retries ({last_error})")
+        raise EIAError(
+            f"EIA API still failing after {self.max_retries} attempts ({last_error})")
 
     # ------------------------------------------------------------------ #
     # Pagination

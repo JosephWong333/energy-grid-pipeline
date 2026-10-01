@@ -220,11 +220,12 @@ def main() -> int:
     parser.add_argument("--ba", default="CISO")
     parser.add_argument("--db", default=os.environ.get(
         "GRID_DB_PATH", str(REPO_ROOT / "data" / "energy_grid.duckdb")))
-    parser.add_argument("--outdir", default=str(REPO_ROOT / "docs" / "img"))
+    parser.add_argument(
+        "--outdir", default=None,
+        help="default: docs/img for real data, data/charts for anything else, "
+             "so watermarked previews never overwrite the README charts")
     args = parser.parse_args()
 
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
     try:
         con = duckdb.connect(args.db, read_only=True)
     except duckdb.Error as exc:
@@ -236,6 +237,13 @@ def main() -> int:
         provenance = data_provenance(con)
         print(f"data provenance: {provenance}"
               + ("" if provenance == "real" else "  -> watermarking output"))
+        if args.outdir:
+            outdir = Path(args.outdir)
+        elif provenance == "real":
+            outdir = REPO_ROOT / "docs" / "img"
+        else:
+            outdir = REPO_ROOT / "data" / "charts"
+        outdir.mkdir(parents=True, exist_ok=True)
         ba_name = con.execute(
             "select ba_name from main_seeds.balancing_authorities where ba_code = ?",
             [args.ba]).fetchone()[0]

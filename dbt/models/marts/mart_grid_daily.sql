@@ -80,11 +80,16 @@ daily as (
 
         sum(c.demand_mwh) / 1000.0                        as demand_gwh,
         max(c.demand_mwh)                                 as peak_demand_mwh,
-        arg_max(c.local_hour, c.demand_mwh)               as peak_demand_hour,
+        -- Ordered first() rather than arg_max/arg_min: ties (equal MWh in two
+        -- hours) resolve to the earliest hour every run instead of whichever
+        -- row a thread saw first, so republishing never flips the answer.
+        first(c.local_hour order by c.demand_mwh desc, c.period_utc)
+            filter (where c.demand_mwh is not null)       as peak_demand_hour,
         avg(c.demand_mwh) / nullif(max(c.demand_mwh), 0)  as load_factor,
 
         min(c.net_load_mwh)                               as min_net_load_mwh,
-        arg_min(c.local_hour, c.net_load_mwh)             as min_net_load_hour,
+        first(c.local_hour order by c.net_load_mwh, c.period_utc)
+            filter (where c.net_load_mwh is not null)     as min_net_load_hour,
 
         sum(c.renewable_mwh)   / nullif(sum(c.total_fuel_mwh), 0)
                                                           as renewable_share,

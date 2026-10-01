@@ -8,6 +8,11 @@
 -- entire 2019-present history of a newly added BA (its old rows fall behind
 -- authorities that are already current). With per-BA watermarks, a BA with
 -- no rows in the target gets its full history on the next ordinary run.
+-- The window starts from the EARLIER of each BA's demand edge and fuel edge:
+-- EIA publishes fuel mix about a day after demand (sometimes several), and
+-- anchoring on demand alone left late fuel stranded with is_fuel_reported =
+-- false. The reach back is capped (var: fuel_heal_max_days) so a BA whose
+-- fuel stops for weeks can't make every nightly reprocess its history.
 --
 -- COMPLETENESS — absence is not zero
 -- EIA publishes demand well before fuel mix. Treating a not-yet-reported
@@ -29,7 +34,15 @@
 {% if is_incremental() %}
 with ba_watermarks as (
 
-    select ba_code, max(period_utc) as max_period
+    select
+        ba_code,
+        greatest(
+            least(
+                max(period_utc),
+                coalesce(max(period_utc) filter (where is_fuel_reported), max(period_utc))
+            ),
+            max(period_utc) - interval '{{ var("fuel_heal_max_days", 14) }} days'
+        ) - interval '{{ var("late_arrival_lookback_hours", 96) }} hours' as reprocess_from
     from {{ this }}
     group by 1
 
@@ -40,8 +53,7 @@ metrics_source as (
     select m.*
     from {{ ref('int_grid_metrics_pivoted') }} m
     left join ba_watermarks w using (ba_code)
-    where m.period_utc > coalesce(w.max_period, timestamp '1900-01-01')
-        - interval '{{ var("late_arrival_lookback_hours", 96) }} hours'
+    where m.period_utc > coalesce(w.reprocess_from, timestamp '1900-01-01')
 
 ),
 
@@ -50,8 +62,7 @@ fuel as (
     select f.*
     from {{ ref('int_fuel_mix_by_category') }} f
     left join ba_watermarks w using (ba_code)
-    where f.period_utc > coalesce(w.max_period, timestamp '1900-01-01')
-        - interval '{{ var("late_arrival_lookback_hours", 96) }} hours'
+    where f.period_utc > coalesce(w.reprocess_from, timestamp '1900-01-01')
 
 ),
 {% else %}
