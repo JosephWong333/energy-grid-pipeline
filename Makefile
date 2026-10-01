@@ -86,4 +86,4 @@ docs:
 	@echo "open dbt/target/static_index.html"
 
 clean:
-	rm -rf data/*.duckdb data/*.duckdb.wal data/sample dbt/target dbt/dbt_packages dbt/logs
+	rm -rf data/*.duckdb data/*.duckdb.wal data/sample data/charts dbt/target dbt/dbt_packages dbt/logs

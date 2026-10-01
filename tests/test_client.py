@@ -135,7 +135,7 @@ def test_retries_on_500_with_exponential_backoff():
 
 def test_gives_up_after_max_retries():
     client, _ = make_client([FakeResponse(503)] * 3, max_retries=3)
-    with pytest.raises(EIAError, match="after 3 retries"):
+    with pytest.raises(EIAError, match="after 3 attempts"):
         list(client.iter_rows("electricity/rto/region-data"))
 
 
@@ -211,3 +211,36 @@ def test_secondary_sort_column_is_requested():
     params = session.calls[0]["params"]
     assert params["sort[1][column]"] == "type"
     assert params["sort[1][direction]"] == "asc"
+
+
+# --------------------------------------------------------------------------- #
+# Hardening added after the Oct 2026 review
+# --------------------------------------------------------------------------- #
+def test_retry_after_http_date_beyond_cap_aborts_cleanly():
+    """Retry-After may be an HTTP-date; a far-future one must still exit 3."""
+    client, _ = make_client(
+        [FakeResponse(429, headers={"Retry-After": "Wed, 01 Jan 2099 00:00:00 GMT"})],
+        max_retry_after_seconds=300,
+    )
+    with pytest.raises(ThrottledError):
+        list(client.iter_rows("electricity/rto/region-data"))
+
+
+def test_error_text_never_carries_the_api_key():
+    echo = {"request": {"params": {"api_key": "test-key"}}, "error": "bad facet"}
+    client, _ = make_client([FakeResponse(400, echo)])
+    with pytest.raises(EIAError) as info:
+        list(client.iter_rows("electricity/rto/region-data"))
+    assert "test-key" not in str(info.value)
+    assert "***" in str(info.value)
+    # A key straddling the 500-character cut must not leak half of itself.
+    pad = "x" * (494 - len('{"a": "'))  # the key spans characters 494-501
+    client, _ = make_client([FakeResponse(400, {"a": pad + "test-key"})])
+    with pytest.raises(EIAError) as info:
+        list(client.iter_rows("electricity/rto/region-data"))
+    assert "test-" not in str(info.value)
+
+
+def test_malformed_record_raises_eia_error_not_a_traceback():
+    with pytest.raises(EIAError, match="Malformed EIA record"):
+        parse_row({"period": None, "respondent": "CISO", "type": "D"}, "type")

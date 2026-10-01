@@ -16,6 +16,10 @@ vars:
   # EIA restates recent hours as balancing authorities revise their reports;
   # 96h covers nearly all restatements while keeping incremental runs cheap.
   late_arrival_lookback_hours: 96
+  # When a BA's fuel mix lags its demand, the fact's window starts from the
+  # fuel edge instead; this caps how far back that can reach. Anything older
+  # heals with a dbt_full_refresh run of the nightly.
+  fuel_heal_max_days: 14
   # EIA-930 identity tolerances: relative band plus an absolute floor so
   # small-BA hours aren't failed on rounding noise.
   # Live EIA-930 data reconciles only loosely (BA reporting boundaries do
@@ -32,6 +36,10 @@ models:
       +materialized: view
     intermediate:
       +materialized: view
+      # Read by the fact and by 15 tests; as a view, its full-history
+      # expected-group logic re-ran for every one of them.
+      int_fuel_mix_by_category:
+        +materialized: table
     marts:
       +materialized: table
 

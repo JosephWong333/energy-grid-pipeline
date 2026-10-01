@@ -33,12 +33,16 @@ select
         where is_fuel_reported
           and not has_fuel_missing_value
           and not has_fuel_extreme_outlier
-          and not has_vre_absent)                                  as fuel_identity_median_rel,
+          and not has_vre_absent
+          and not has_fuel_group_absent
+          and not has_fuel_implausible_value)                      as fuel_identity_median_rel,
     count(*) filter (
         where is_fuel_reported
           and not has_fuel_missing_value
           and not has_fuel_extreme_outlier
-          and not has_vre_absent)                                  as n_fuel_hours
+          and not has_vre_absent
+          and not has_fuel_group_absent
+          and not has_fuel_implausible_value)                      as n_fuel_hours
 
 from hourly
 group by 1, 2

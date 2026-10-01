@@ -4,7 +4,10 @@ sources:
   - name: eia_raw
     description: Raw EIA-930 hourly data landed by the Python ingestion layer.
     schema: raw
-    loaded_at_field: _ingested_at
+    # Freshness is measured on the data's own clock. _ingested_at would not
+    # work: every nightly re-fetches a 72h lookback and re-stamps rows, so it
+    # stays fresh even when EIA has published nothing new.
+    loaded_at_field: period_utc
     freshness:
       warn_after: {count: 36, period: hour}
       error_after: {count: 96, period: hour}

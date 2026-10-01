@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
 
 import pytest
@@ -133,10 +134,13 @@ def test_pilot_replay_then_backfill_still_covers_full_history(con, cfg):
     ordinary backfill. The backfill must start at backfill_start, not at
     'last week' — the exact bug this guards against."""
     from grid_pipeline.ingest import run_backfill
-    run_backfill(cfg, con, _CapturingClient(),
+    # One BA keeps this fast (the full list walked ~2,000 month windows and
+    # got slower every month); the property under test is per pair anyway.
+    one = dataclasses.replace(cfg, balancing_authorities=["CISO"])
+    run_backfill(one, con, _CapturingClient(),
                  replay_since=datetime(2026, 7, 4))
     backfill_client = _CapturingClient()
-    run_backfill(cfg, con, backfill_client)
+    run_backfill(one, con, backfill_client)
     first_start = backfill_client.calls[0][1]
     assert first_start.startswith(cfg.backfill_start[:7])  # 2019-01, not July
 

@@ -18,13 +18,13 @@ curve, peak analytics.
 |:---|:---|
 | **Coverage** | 11 US balancing authorities (CAISO, ERCOT, MISO, PJM, NYISO, ISO-NE, SPP, BPA, FPL, Duke, Southern), hourly since 2019 |
 | **Scale** | 7.7M+ raw rows → 746K+ row hourly fact table |
-| **Quality** | 123 dbt data tests + 31 unit tests on every PR, with zero credentials |
+| **Quality** | 124 dbt data tests + 48 unit tests on every PR, with zero credentials |
 | **Runs** | Nightly on GitHub Actions since Aug 2026: EIA → MotherDuck → BigQuery → dashboard |
 | **Security** | Keyless Google auth (Workload Identity Federation): no service-account key exists |
 | **Cost** | $0/month on free tiers |
 | **Stack** | Python · DuckDB/MotherDuck · dbt · GitHub Actions · BigQuery · GCS · Google Data Studio (formerly Looker Studio) |
 
-The entire pipeline — ingestion, models, and 123 data tests — runs in CI on every
+The entire pipeline — ingestion, models, and 124 data tests — runs in CI on every
 pull request with **zero credentials**, using seeded, API-shaped fixtures
 that go through the same parser and upsert code as live data. A nightly
 GitHub Actions job refreshes real data into MotherDuck, then publishes the
@@ -46,10 +46,12 @@ plus solar), and **renewable share by month** across all 11 balancing
 authorities.
 
 The nightly exports the four marts to Parquet on GCS and loads them into
-BigQuery: the hourly fact one day per partition (the last 5 days each night),
-the three small marts as whole-table replaces. Every load replaces its target,
-so the publish is idempotent for the same reason the dbt run is: re-running
-converges instead of accumulating.
+BigQuery: the hourly fact one day per partition (the last 5 days each night,
+plus any older day a recent ingest touched, or one whole-table load when
+that is more than a month of days), the three small marts as whole-table
+replaces. Every load replaces its target, so the publish is idempotent for
+the same reason the dbt run is: re-running converges instead of
+accumulating.
 
 ## Architecture
 
@@ -77,6 +79,20 @@ It runs unattended every night, and it has broken. What broke, and what changed:
 | Aug 31, 2026 | MotherDuck's trial expired overnight and the nightly went red | Moved to the free plan; one `publish_mode=full` run backfilled BigQuery |
 | Sept 5-12, 2026 | EIA intermittently stopped sending ISO-NE's oil-generation rows; the coverage test failed the build and blocked publishing for all 11 BAs | Coverage became graded: 1-3 BAs with gaps warn and publishing continues; 4+ fail the build, because independent operators don't go dark together |
 | Sept 23, 2026 | A network blip during the keyless token refresh killed one publish | Every gcloud/bq call now retries (up to 3 attempts; safe: every load is idempotent); the 5-day partition window had already re-published the missed day the next night |
+| Oct 1, 2026 | A review found that fuel data arriving more than a few days after its demand never reached the hourly fact, and that a BA catching up after a lag never reached BigQuery; the nightly stayed green through both | The fact's reprocess window now starts from each BA's fuel edge (capped at 14 days), the publish also re-sends any older day a recent ingest touched, and a new warn-level test flags fact hours that fall behind their fuel data (one `dbt_full_refresh` run heals them) |
+
+Levers, all from **Actions → Nightly refresh → Run workflow** or repo settings:
+
+- `publish_mode=full` re-sends every BigQuery partition. Use it after two or
+  more nights in a row without a successful publish; one missed night heals
+  on its own.
+- `dbt_full_refresh=true` rebuilds every model from raw and publishes in
+  full: after seed edits, a BA starting to report a new fuel group, a change
+  to `fct_grid_hourly`'s columns, or a WARN from
+  `assert_fct_fuel_is_current`.
+- Repository variable `PUBLISH_ENABLED=false` skips the Google steps
+  entirely (MotherDuck keeps refreshing and the run stays green). When you
+  turn it back on, dispatch once with `publish_mode=full`.
 
 ## Quickstart
 
@@ -89,7 +105,7 @@ git clone https://github.com/JosephWong333/energy-grid-pipeline.git
 cd energy-grid-pipeline
 python3 -m venv .venv && source .venv/bin/activate
 make setup      # pip install + dbt deps
-make dev        # fixtures -> ingest -> dbt build (123 tests) -> charts, all on data/dev_fixtures.duckdb
+make dev        # fixtures -> ingest -> dbt build (124 tests) -> watermarked charts in data/charts/
 ```
 
 **Real data** (free EIA key, ~1 minute to get):
@@ -147,7 +163,9 @@ second, not the first), `peak_demand_hour`, `load_factor`, per-fuel MWh.
 **Late-arriving data.** EIA restates recent hours as balancing authorities
 revise their reports. Ingestion therefore re-fetches a 72h lookback window on
 every incremental run (idempotent by PK upsert), and `fct_grid_hourly`
-reprocesses a 96h window with `delete+insert` on its grain. Restatements are
+reprocesses a 96h window with `delete+insert` on its grain. That window starts
+from the earlier of each BA's demand edge and fuel edge, because EIA publishes
+fuel mix about a day after demand and sometimes several. Restatements are
 self-healing end to end. Anything older is repaired **at the source** with a
 forced replay — `make replay SINCE=YYYY-MM-DD` re-fetches raw history through
 the same idempotent upserts *and then full-refreshes every mart*, because a
@@ -164,8 +182,8 @@ silently skips the entire history of a newly added BA (its 2019 rows fall
 with no rows in the fact gets its full history on the next ordinary run. The
 same idea applies at ingestion: an incremental run that finds a never-loaded
 (route, BA) pair bootstraps it through the same resumable month windows a
-backfill uses, so the first run against an empty prod warehouse is
-crash-safe rather than one fragile giant request range.
+backfill uses, and so does a catch-up of more than a month, so neither is
+one fragile giant request range.
 
 **UTC in, local derived.** Raw periods are stored exactly as EIA serves them
 (UTC). Local wall-clock time is derived in dbt via each BA's IANA timezone
@@ -210,8 +228,9 @@ same suite on two SQL dialects that differ on timestamp types, interval
 syntax and function names would double the test surface to serve a table
 under a gigabyte. Past that size the answer is dbt-bigquery with
 cross-db macros — not this. Every `gcloud`/`bq` call gets up to 3 attempts,
-and each night re-publishes a 5-day partition window, so a failed night heals
-itself.
+and each night re-publishes a 5-day partition window plus any older day a
+recent ingest touched, so a failed night heals itself. The publish refuses
+fixture data and local warehouses, and CI dry-runs it on every PR.
 
 **GitHub Actions as the orchestrator.** A daily batch with one dependency
 chain doesn't need an always-on scheduler. Cron-triggered Actions are free,
@@ -220,9 +239,11 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
 
 ## Testing
 
-- **123 dbt data tests** on every build: grain uniqueness, nullability,
+- **124 dbt data tests** on every build: grain uniqueness, nullability,
   accepted ranges, relationship integrity, a symmetric fact↔source
-  reconciliation, and custom `non_negative` checks scoped to unflagged rows.
+  reconciliation (plus a fuel-side one that warns when the incremental fact
+  has fallen behind its fuel data), and custom `non_negative` checks scoped
+  to unflagged rows.
   Severities are deliberate: a new fuel code *warns* (data keeps flowing
   into `other_mwh`, and it shows up as a WARN in the CI and nightly logs);
   broken grain, lost rows, or four or more balancing authorities with
@@ -246,17 +267,26 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
   marts carry completeness flags, so the gap stays visible); four or more
   usually means something is broken on our side, because independent
   operators don't go dark together, and the build stops before publish.
-- **31 Python unit tests**: pagination (with truncation detection),
+- **48 Python unit tests**: the nightly path end to end (incremental
+  lookback as one request, bootstrap and long catch-ups in month windows,
+  exit codes 2/3/4),
+  the publish script (retries, source guards, touched partitions and the
+  escalation to a full replace),
+  pagination (with truncation detection),
   response integrity (wrong-respondent, out-of-window, or odd-unit rows
   raise before any upsert or watermark motion),
   per-request throttling, replay/watermark semantics (a short pilot can
   never poison a backfill; watermarks are monotonic by construction),
   retry/backoff (honoring *and capping*
-  `Retry-After`), type coercion against an API-shaped sample response, idempotent
+  `Retry-After`, including HTTP-date values), EIA error messages scrubbed of
+  the API key, type coercion against an API-shaped sample response, idempotent
   upserts, watermark round-trips, window construction, and regression tests
   for the fixture/real contamination guards and fail-closed provenance.
-- **Source freshness** SLAs on raw tables (warn 36h / error 96h), checked
-  nightly.
+- **Source freshness** SLAs on raw tables, measured on the newest data hour
+  (`period_utc`): warn after 36h, error after 96h, checked nightly.
+- **Publish dry run**: CI runs the BigQuery publish script in both modes
+  against the fixture warehouse, so a broken export fails the PR rather than
+  the nightly.
 - **Pinned environment**: `requirements.lock` is a full `pip freeze` —
   every transitive dependency — and it's what `make setup`, CI, and the
   nightly job actually install (`-r requirements.lock` + `-e . --no-deps`).
@@ -267,11 +297,11 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
 - Negative **total interchange** is legitimate (net imports — CAISO is
   usually negative). Negative **demand** is a reporting glitch and gets
   flagged.
-- Storage and hybrid fuels (`PS`, `BAT`, `OES`, `SNB`, `WNB`) legitimately
-  report negative when charging; hourly share metrics can exceed 1.0 in
-  those hours because charging shrinks the denominator. The share range
-  tests are scoped to non-charging hours, where the [0,1] invariant
-  actually holds.
+- Storage and hybrid fuels (`PS`, `BAT`, `OES`, `UES`, `SNB`, `WNB`) and `OTH`
+  (where CAISO reports its batteries) legitimately report negative when
+  charging; hourly share metrics can exceed 1.0 in those hours because
+  charging shrinks the denominator. The share range tests are scoped to
+  non-charging hours, where the [0,1] invariant actually holds.
 - **Missing is not zero.** EIA publishes demand well before fuel mix, so the
   newest hours often have demand but no fuel report yet. `net_load_mwh` is
   only computed when the hour's fuel report exists (`is_net_load_valid`);

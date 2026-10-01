@@ -7,10 +7,16 @@ name: Nightly refresh
 # Required repository secrets:
 #   EIA_API_KEY       — free key from https://www.eia.gov/opendata/register.php
 #   MOTHERDUCK_TOKEN  — from https://motherduck.com (free tier is plenty)
+# Each secret is handed only to the steps that use it, so the install step
+# and the third-party Google actions never see them.
 #
 # Required repository variables (not secrets — none of these are sensitive,
 # and having them readable in the log is what makes an auth failure debuggable):
 #   GCP_PROJECT_ID, GCP_WIF_PROVIDER, GCP_SERVICE_ACCOUNT
+# Optional repository variable:
+#   PUBLISH_ENABLED   — set to "false" to skip the Google steps (for example
+#                       if the GCP project is shut down); MotherDuck keeps
+#                       refreshing and the run stays green.
 # Google auth is keyless via Workload Identity Federation. There is no service
 # account JSON anywhere in this repo or its secrets.
 
@@ -24,6 +30,10 @@ on:
         type: choice
         options: [incremental, full]
         default: incremental
+      dbt_full_refresh:
+        description: "Rebuild every dbt model from raw and re-publish all of BigQuery (after seed edits, a new fuel group, fct column changes, or a fuel-currency warning)"
+        type: boolean
+        default: false
 
 concurrency:
   group: nightly-refresh
@@ -41,16 +51,17 @@ jobs:
       contents: read
 
     env:
-      EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
-      MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
       GRID_DB_PATH: "md:energy_grid"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.lock
 
       - name: Install
         run: |
@@ -58,15 +69,22 @@ jobs:
           pip install -e . --no-deps
 
       - name: Incremental ingest (EIA API -> MotherDuck)
+        env:
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
         run: python -m grid_pipeline.ingest --mode incremental
 
       - name: dbt deps
         run: dbt deps --project-dir dbt --profiles-dir dbt
 
       - name: dbt build (prod)
+        id: build
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          FULL_REFRESH_FLAG: ${{ inputs.dbt_full_refresh && '--full-refresh' || '' }}
         run: >-
           dbt build --project-dir dbt --profiles-dir dbt --target prod
-          --vars '{expect_full_history: true}'
+          --vars '{expect_full_history: true}' $FULL_REFRESH_FLAG
 
       # --- serving layer -------------------------------------------------
       # Publishing runs BEFORE source freshness on purpose. Freshness failing
@@ -75,6 +93,7 @@ jobs:
       # silently freeze BigQuery while the warehouse was perfectly fine.
 
       - name: Authenticate to Google Cloud (keyless)
+        if: ${{ vars.PUBLISH_ENABLED != 'false' }}
         uses: google-github-actions/auth@v3
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
@@ -82,17 +101,27 @@ jobs:
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - uses: google-github-actions/setup-gcloud@v3
+        if: ${{ vars.PUBLISH_ENABLED != 'false' }}
 
       # `full` is the recovery lever, never the schedule. The incremental
       # window is 5 days, so an outage longer than that would leave a hole in
       # BigQuery that no later incremental run would ever revisit. Reseeding
       # is one dispatch rather than a manual backfill script.
       - name: Publish marts to GCS + BigQuery
+        if: ${{ vars.PUBLISH_ENABLED != 'false' }}
         env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCS_BUCKET: eia-grid-930-marts
           BQ_DATASET: energy_grid
-        run: python scripts/export_to_cloud.py --mode "${{ inputs.publish_mode || 'incremental' }}"
+          # A full dbt rebuild can change any day, so it always publishes in full.
+          PUBLISH_MODE: ${{ inputs.dbt_full_refresh && 'full' || inputs.publish_mode || 'incremental' }}
+        run: python scripts/export_to_cloud.py --mode "$PUBLISH_MODE"
 
+      # Runs whenever the warehouse build succeeded, even if the publish
+      # failed or is switched off: it reports on the data, not the publish.
       - name: Source freshness
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
         run: dbt source freshness --project-dir dbt --profiles-dir dbt --target prod
