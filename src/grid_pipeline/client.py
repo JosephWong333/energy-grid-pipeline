@@ -8,7 +8,7 @@ Design notes
   merely between pages of one query — a backfill of single-page month
   windows must not burst-fire requests. EIA asks clients to stay well under
   ~5 requests/second.
-* Retries cover 429/5xx AND transport-level failures (timeouts, connection
+* Retries cover 429/500/502/503/504 AND transport-level failures (timeouts, connection
   resets, malformed JSON), with exponential backoff. `Retry-After` is
   honored up to a hard cap; a server demanding an absurd wait (the shared
   demo key can return values in the hours) aborts cleanly with

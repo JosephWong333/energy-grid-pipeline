@@ -54,8 +54,8 @@ models:
       - name: has_vre_negative_anomaly
         tests: [not_null]
       - name: has_fuel_group_absent
-        description: Any expected fuel group (this month ∪ prior month ∪ seed VRE declarations) has no row this hour; gates fuel-mix validity, not net load.
+        description: An expected fuel group has no row this hour. A group becomes expected once the BA reports it for 100+ hours in a month and stays expected until fuel_group_retirements ends it; seed VRE declarations add solar/wind. Gates fuel-mix validity, not net load.
         tests: [not_null]
       - name: has_vre_absent
-        description: A solar/wind row is absent this hour although this BA reports that group in this calendar month — publication lag, not zero.
+        description: A solar/wind row is absent this hour although the BA is expected to report that group (persisted expectation or seed declaration). Missing is not zero, so net load is invalidated.
         tests: [not_null]

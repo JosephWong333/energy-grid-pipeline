@@ -2,22 +2,23 @@
 
 Coverage
 --------
-* ALL ten configured balancing authorities, each with a distinct grid
+* ALL 11 configured balancing authorities, each with a distinct grid
   archetype (solar-heavy CISO, wind-heavy ERCO/SWPP, hydro-dominant BPAT,
   nuclear/gas east-coast profiles, ...), so seed-coverage and per-BA
-  freshness tests are exercised for real in CI.
+  recency tests are exercised for real in CI.
 * Local-time shapes use each BA's IANA zone straight from the dbt seed via
   zoneinfo — correct offsets year-round, no hardcoded summer offsets.
-* Two windows: a rolling 14-day window ending near now (freshness tests),
-  plus a fixed slice around the 2026-03-08 US spring-forward (23-hour local
-  days, exercising DST-exact completeness).
+* Three windows: a rolling 14-day window ending near now (recency and
+  coverage tests), plus fixed slices around the 2026-03-08 US spring-forward
+  (23-hour local days) and the 2025-11-02 fall-back (25-hour local days),
+  exercising DST-exact completeness.
 
 Physics (same identities the dbt reconciliation tests assert):
   demand = net_generation - total_interchange; per-fuel sums equal net
   generation; storage/hybrids carry signed values (charge = negative).
 
 Planted quirks, mirroring the live API:
-  * ~30% of values serialized as strings, ~0.5% as nulls
+  * ~30% of values serialized as strings, ~0.2% as nulls
   * CISO hour 100:  impossible negative demand
   * CISO hour 50:   fuel report entirely absent
   * CISO hour 130:  ONLY the solar rows (SUN+SNB) absent -> has_vre_absent
@@ -236,8 +237,8 @@ def main() -> None:
     write("region_data", region, 2)
     write("fuel_mix", fuel, 4)
     print(f"wrote {len(region)} region + {len(fuel)} fuel records "
-          f"({len(PROFILES)} BAs; rolling window ends {end}; DST slice "
-          f"2026-03-07..09) to {OUT_DIR}")
+          f"({len(PROFILES)} BAs; rolling window ends {end}; DST slices "
+          f"2026-03-07..09 and 2025-11-01..03) to {OUT_DIR}")
 
 
 if __name__ == "__main__":

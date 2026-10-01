@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "energy-grid-pipeline"
 version = "0.1.0"
 description = "Hourly US power-grid analytics: EIA-930 API -> DuckDB -> dbt"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "requests>=2.31,<3",
     "duckdb>=1.1,<2",
@@ -33,7 +33,7 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]

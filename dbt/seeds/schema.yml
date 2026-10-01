@@ -4,10 +4,10 @@ seeds:
   - name: balancing_authorities
     description: >
       Descriptive attributes for each EIA-930 balancing authority tracked by
-      the pipeline. `timezone` is the predominant IANA zone used to derive
-      local wall-clock time. Note: MISO spans multiple zones; its market runs
-      on Eastern Prevailing Time (EPT = EST/EDT per the MISO market
-      timetable), so the seed maps it to America/New_York.
+      the pipeline. `timezone` is the IANA zone of the operator's market
+      clock, used to derive local wall-clock time. Note: MISO spans multiple
+      zones; its market runs on Eastern Prevailing Time (EPT = EST/EDT per
+      the MISO market timetable), so the seed maps it to America/New_York.
     columns:
       - name: ba_code
         description: EIA-930 respondent code (primary key).
@@ -21,18 +21,18 @@ seeds:
         description: True if the BA is an organized ISO/RTO market.
         tests: [not_null]
       - name: expects_solar
-        description: Fail-closed declaration that this BA reports utility-scale solar; an absent solar row on a declared BA invalidates net load even if the whole month is missing. Adjust from evidence after the first real backfill.
+        description: Fail-closed declaration that this BA reports utility-scale solar; an absent solar row on a declared BA invalidates net load even if the whole month is missing. Set from evidence (SOCO's wind flag was corrected from the data).
         tests: [not_null]
       - name: expects_wind
-        description: Same declaration for wind (FPL legitimately reports none).
+        description: Same declaration for wind (FPL and DUK legitimately report none).
         tests: [not_null]
 
   - name: fuel_types
     description: >
       EIA-930 fuel codes with two deliberately distinct flags: `is_renewable`
-      (wind/solar/hydro) and `is_carbon_free` (renewables + nuclear). Nuclear
-      is carbon-free but not renewable; the distinction matters for any real
-      decarbonization analysis.
+      (wind/solar/hydro/geothermal) and `is_carbon_free` (renewables +
+      nuclear). Nuclear is carbon-free but not renewable; the distinction
+      matters for any real decarbonization analysis.
     columns:
       - name: fuel_code
         tests: [unique, not_null]
@@ -60,7 +60,8 @@ seeds:
       persist from FIRST observation forever — a sustained outage can never
       age into "normal" — so a legitimate retirement (a BA closing its last
       coal plant) must be declared here intentionally, with the first month
-      the group is allowed to be absent. Ships empty by design.
+      the group is allowed to be absent. One row today: ISNE coal, absent
+      from April 2026.
     columns:
       - name: retired_month
         tests: [not_null]

@@ -3,12 +3,12 @@
 #   make setup        install everything (editable + dev tools)
 #   make dev          full local pipeline on synthetic fixtures (no API key)
 #   make backfill     load full history from the EIA API (needs EIA_API_KEY)
-#   make incremental  refresh recent hours from the EIA API
+#   make incremental  refresh recent hours from the EIA API, then dbt build
 #   make build        dbt build (models + tests)
 #   make test         pytest + dbt build
 #   make lint         ruff
 #   make charts       render README charts from the marts
-#   make docs         generate dbt docs (target/static_index.html)
+#   make docs         generate dbt docs (dbt/target/static_index.html)
 #   make clean        remove local warehouse + build artifacts
 
 DBT_FLAGS := --project-dir dbt --profiles-dir dbt

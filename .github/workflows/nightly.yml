@@ -1,7 +1,8 @@
 name: Nightly refresh
 
 # Real-data run: incremental ingest from the EIA API into MotherDuck, then
-# dbt build + source freshness against the prod target.
+# dbt build against the prod target, publish to GCS + BigQuery, and
+# source freshness.
 #
 # Required repository secrets:
 #   EIA_API_KEY       — free key from https://www.eia.gov/opendata/register.php

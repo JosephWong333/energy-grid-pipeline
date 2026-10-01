@@ -2,8 +2,8 @@
 -- identities, really? The identity TESTS are deliberately loose sanity
 -- bands (see dbt_project vars); this mart is where the actual residual
 -- distributions live, so drift is something you can query and chart rather
--- than a wall of warn rows. After the first real backfill, use this to set
--- per-BA tolerances on evidence instead of guesses.
+-- than a wall of warn rows. Use this to set per-BA tolerances on evidence
+-- instead of guesses (not done yet; the bands are still global).
 
 with hourly as (
 

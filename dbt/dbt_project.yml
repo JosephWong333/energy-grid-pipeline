@@ -21,8 +21,8 @@ vars:
   # Live EIA-930 data reconciles only loosely (BA reporting boundaries do
   # not net out cleanly); tight tolerances would warn every night and become
   # noise. These are wide sanity bands that catch unit/sign errors; the
-  # mart_identity_residuals model is the tool for actually WATCHING drift,
-  # and per-BA tuning should follow the first real backfill.
+  # mart_identity_residuals model is the tool for actually WATCHING drift;
+  # per-BA tuning from it is still to do (the bands are global today).
   recon_rel_tol: 0.25
   recon_abs_floor_mwh: 1500
 
