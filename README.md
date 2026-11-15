@@ -18,7 +18,7 @@ curve, peak analytics.
 |:---|:---|
 | **Coverage** | 11 US balancing authorities (CAISO, ERCOT, MISO, PJM, NYISO, ISO-NE, SPP, BPA, FPL, Duke, Southern), hourly since 2019 |
 | **Scale** | 7.7M+ raw rows → 746K+ row hourly fact table |
-| **Quality** | 124 dbt data tests + 48 unit tests on every PR, with zero credentials |
+| **Quality** | 124 dbt data tests + 57 unit tests on every PR, with zero credentials |
 | **Runs** | Nightly on GitHub Actions since Aug 2026: EIA → MotherDuck → BigQuery → dashboard |
 | **Security** | Keyless Google auth (Workload Identity Federation): no service-account key exists |
 | **Cost** | $0/month on free tiers |
@@ -80,6 +80,7 @@ It runs unattended every night, and it has broken. What broke, and what changed:
 | Sept 5-12, 2026 | EIA intermittently stopped sending ISO-NE's oil-generation rows; the coverage test failed the build and blocked publishing for all 11 BAs | Coverage became graded: 1-3 BAs with gaps warn and publishing continues; 4+ fail the build, because independent operators don't go dark together |
 | Sept 23, 2026 | A network blip during the keyless token refresh killed one publish | Every gcloud/bq call now retries (up to 3 attempts; safe: every load is idempotent); the 5-day partition window had already re-published the missed day the next night |
 | Oct 1, 2026 | A review found that fuel data arriving more than a few days after its demand never reached the hourly fact, and that a BA catching up after a lag never reached BigQuery; the nightly stayed green through both | The fact's reprocess window now starts from each BA's fuel edge (capped at 14 days), the publish also re-sends any older day a recent ingest touched, and a new warn-level test flags fact hours that fall behind their fuel data (one `dbt_full_refresh` run heals them) |
+| Oct 17, Oct 19 and Nov 15, 2026 | EIA's API had slow spells (read timeouts and 504s); on three nights one request used up all five of the client's attempts and the nightly went red. Each gap closed on the next green run, which re-fetches the trailing 72 hours | The ingest step now resumes on its own: on the resumable exit code (4) it waits five minutes and runs again, up to three attempts in all. A night that needed one stays green and carries a warning on its run page, and a unit test runs the workflow's own shell against a stub to pin the policy |
 
 Levers, all from **Actions → Nightly refresh → Run workflow** or repo settings:
 
@@ -267,9 +268,10 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
   marts carry completeness flags, so the gap stays visible); four or more
   usually means something is broken on our side, because independent
   operators don't go dark together, and the build stops before publish.
-- **48 Python unit tests**: the nightly path end to end (incremental
+- **57 Python unit tests**: the nightly path end to end (incremental
   lookback as one request, bootstrap and long catch-ups in month windows,
-  exit codes 2/3/4),
+  exit codes 2/3/4, and the workflow's resume-on-exit-4 loop, run from
+  `nightly.yml` against a stub ingest),
   the publish script (retries, source guards, touched partitions and the
   escalation to a full replace),
   pagination (with truncation detection),

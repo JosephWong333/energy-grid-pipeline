@@ -68,11 +68,34 @@ jobs:
           pip install -r requirements.lock
           pip install -e . --no-deps
 
+      # EIA's API has slow spells: read timeouts and 504s that can use up the
+      # client's five attempts on a single request. Three nights went red
+      # that way (Oct 17, Oct 19, Nov 15). Exit code 4 means "nothing from
+      # the failing window was loaded; re-run the same command to resume",
+      # so this step does that itself after a pause, up to INGEST_ATTEMPTS
+      # runs in total. Nothing else is retried: 2 is the contamination
+      # guard, 3 means EIA asked for a wait longer than the client's cap
+      # (tomorrow's run resumes), and 1 is a crash. A night that needed
+      # another attempt stays green and carries a warning annotation, so
+      # slow spells stay visible on the run page.
       - name: Incremental ingest (EIA API -> MotherDuck)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
-        run: python -m grid_pipeline.ingest --mode incremental
+          INGEST_ATTEMPTS: "3"
+          INGEST_RETRY_WAIT_SECONDS: "300"
+        run: |
+          attempt=1
+          while true; do
+            code=0
+            python -m grid_pipeline.ingest --mode incremental || code=$?
+            if [ "$code" -ne 4 ] || [ "$attempt" -ge "$INGEST_ATTEMPTS" ]; then
+              exit "$code"
+            fi
+            echo "::warning title=Ingest resumed::Attempt $attempt of $INGEST_ATTEMPTS exited 4 (resumable EIA error). Resuming in ${INGEST_RETRY_WAIT_SECONDS}s."
+            sleep "$INGEST_RETRY_WAIT_SECONDS"
+            attempt=$((attempt + 1))
+          done
 
       - name: dbt deps
         run: dbt deps --project-dir dbt --profiles-dir dbt
