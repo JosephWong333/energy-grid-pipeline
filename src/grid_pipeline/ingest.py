@@ -11,7 +11,9 @@ incremental  Per (route, BA): if a watermark exists, re-fetch a trailing
              is one request. A range longer than a month (a bootstrap, or
              a catch-up after a long outage) is walked in the same
              resumable month windows a backfill uses, so it is as
-             crash-safe as a local backfill.
+             crash-safe as a local backfill. With --checkpoint, a re-run
+             after a failure fetches only the pairs the failed run did
+             not finish.
 fixtures     Load seeded synthetic pages through the REAL parse and
              upsert code — used by CI and local dev. (It skips the HTTP
              client and the per-window response checks, which pytest
@@ -33,6 +35,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -218,31 +221,74 @@ def run_backfill(cfg, con, client, replay_since: datetime | None = None) -> None
     log.info("Backfill complete: %d rows upserted", total)
 
 
-def run_incremental(cfg, con, client) -> None:
+def _read_checkpoint(path: Path | None) -> set[str]:
+    """The 'route_key/BA' pairs an earlier run of this command finished."""
+    if path is None or not path.exists():
+        return set()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return {line.strip() for line in lines if line.strip()}
+
+
+def run_incremental(cfg, con, client, checkpoint: Path | None = None) -> None:
+    """Refresh every (route, BA) pair from its own watermark.
+
+    ``checkpoint`` turns a re-run after a failure into a real resume. Each
+    pair is appended to the file once all of its windows are loaded, pairs
+    already listed are skipped, and the file is removed when a run
+    completes. Without it a re-run fetches every pair again, so during an
+    EIA slow spell nothing a failed run finished counts toward the next
+    one (Nov 25, 2026: one attempt got through at least 18 of the 22
+    pairs, and the two after it started from the first pair and died
+    sooner). Skipping is safe: a listed pair's rows and watermark are
+    already saved, and the next night re-fetches its lookback as usual.
+    """
     now = datetime.now(UTC).replace(tzinfo=None, minute=0, second=0, microsecond=0)
     backfill_start = datetime.strptime(cfg.backfill_start, "%Y-%m-%d")
     lookback = timedelta(hours=cfg.incremental_lookback_hours)
+    done = _read_checkpoint(checkpoint)
+    pairs = [(route, ba) for route in build_routes(cfg)
+             for ba in cfg.balancing_authorities]
+    todo = [(route, ba) for route, ba in pairs if f"{route['key']}/{ba}" not in done]
+    if len(todo) < len(pairs):
+        log.info("Resuming from %s: %d of %d pairs already refreshed, "
+                 "fetching the other %d", checkpoint, len(pairs) - len(todo),
+                 len(pairs), len(todo))
     total = 0
-    for route in build_routes(cfg):
-        for ba in cfg.balancing_authorities:
-            wm = db.get_watermark(con, route["key"], ba)
-            if wm is None:
-                log.info("%s/%s has no watermark — bootstrapping full history",
-                         route["key"], ba)
-            # A normal night is one request, [wm - lookback, now]. A range
-            # longer than a month (a new pair, or a catch-up after a long
-            # outage) walks month windows instead of one fragile giant range,
-            # and a crash keeps every finished month.
-            start = backfill_start if wm is None else wm - lookback
-            if now - start > MAX_SINGLE_REQUEST_SPAN:
-                windows = list(_month_windows(start, now))
-            else:
-                windows = [(start, now)]
+    for route, ba in todo:
+        pair = f"{route['key']}/{ba}"
+        wm = db.get_watermark(con, route["key"], ba)
+        if wm is None:
+            log.info("%s has no watermark — bootstrapping full history", pair)
+        # A normal night is one request, [wm - lookback, now]. A range
+        # longer than a month (a new pair, or a catch-up after a long
+        # outage) walks month windows instead of one fragile giant range,
+        # and a crash keeps every finished month.
+        start = backfill_start if wm is None else wm - lookback
+        if now - start > MAX_SINGLE_REQUEST_SPAN:
+            windows = list(_month_windows(start, now))
+        else:
+            windows = [(start, now)]
+        began = time.monotonic()
+        rows = 0
+        try:
             for w_start, w_end in windows:
-                total += _load_window(con, client, route, ba, w_start, w_end,
-                                      SOURCE_API)
+                rows += _load_window(con, client, route, ba, w_start, w_end,
+                                     SOURCE_API)
+        except EIAError:
+            # Name the pair: the client's error only knows the route.
+            log.error("%s failed after %.0fs", pair, time.monotonic() - began)
+            raise
+        log.info("%s: %d rows in %.1fs", pair, rows, time.monotonic() - began)
+        total += rows
+        if checkpoint is not None:
+            with checkpoint.open("a", encoding="utf-8") as fh:
+                fh.write(f"{pair}\n")
     db.set_load_meta(con, "source", SOURCE_API)
     db.set_load_meta(con, "last_incremental_at", datetime.now(UTC).isoformat())
+    if checkpoint is not None:
+        # The run is complete, so nothing is left to resume. Leaving the
+        # file would make the next run skip every pair.
+        checkpoint.unlink(missing_ok=True)
     log.info("Incremental complete: %d rows upserted", total)
 
 
@@ -289,11 +335,20 @@ def main(argv: list[str] | None = None) -> int:
         "--replay-since", metavar="YYYY-MM-DD",
         help="(backfill only) ignore watermarks and re-fetch history from this "
              "date — repairs old upstream restatements via idempotent upserts")
+    parser.add_argument(
+        "--checkpoint", metavar="PATH", type=Path,
+        help="(incremental only) record each finished (route, BA) pair in this "
+             "file and skip the pairs already listed, so a re-run after a "
+             "failure resumes; the file is removed when a run completes")
     args = parser.parse_args(argv)
     replay_since = (datetime.strptime(args.replay_since, "%Y-%m-%d")
                     if args.replay_since else None)
     if replay_since and args.mode != "backfill":
         parser.error("--replay-since only applies to --mode backfill")
+    if args.checkpoint and args.mode != "incremental":
+        parser.error("--checkpoint only applies to --mode incremental")
+    if args.checkpoint:
+        args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config()
     db_path = resolve_db_path(args.mode, cfg)
@@ -317,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.mode == "backfill":
                 run_backfill(cfg, con, client, replay_since=replay_since)
             else:
-                run_incremental(cfg, con, client)
+                run_incremental(cfg, con, client, checkpoint=args.checkpoint)
     except ContaminationError as exc:
         log.error(str(exc))
         return 2

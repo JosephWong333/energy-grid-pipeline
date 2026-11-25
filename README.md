@@ -18,7 +18,7 @@ curve, peak analytics.
 |:---|:---|
 | **Coverage** | 11 US balancing authorities (CAISO, ERCOT, MISO, PJM, NYISO, ISO-NE, SPP, BPA, FPL, Duke, Southern), hourly since 2019 |
 | **Scale** | 7.7M+ raw rows → 746K+ row hourly fact table |
-| **Quality** | 124 dbt data tests + 57 unit tests on every PR, with zero credentials |
+| **Quality** | 124 dbt data tests + 66 unit tests on every PR, with zero credentials |
 | **Runs** | Nightly on GitHub Actions since Aug 2026: EIA → MotherDuck → BigQuery → dashboard |
 | **Security** | Keyless Google auth (Workload Identity Federation): no service-account key exists |
 | **Cost** | $0/month on free tiers |
@@ -81,6 +81,7 @@ It runs unattended every night, and it has broken. What broke, and what changed:
 | Sept 23, 2026 | A network blip during the keyless token refresh killed one publish | Every gcloud/bq call now retries (up to 3 attempts; safe: every load is idempotent); the 5-day partition window had already re-published the missed day the next night |
 | Oct 1, 2026 | A review found that fuel data arriving more than a few days after its demand never reached the hourly fact, and that a BA catching up after a lag never reached BigQuery; the nightly stayed green through both | The fact's reprocess window now starts from each BA's fuel edge (capped at 14 days), the publish also re-sends any older day a recent ingest touched, and a new warn-level test flags fact hours that fall behind their fuel data (one `dbt_full_refresh` run heals them) |
 | Oct 17, Oct 19 and Nov 15, 2026 | EIA's API had slow spells (read timeouts and 504s); on three nights one request used up all five of the client's attempts and the nightly went red. Each gap closed on the next green run, which re-fetches the trailing 72 hours | The ingest step now resumes on its own: on the resumable exit code (4) it waits five minutes and runs again, up to three attempts in all. A night that needed one stays green and carries a warning on its run page, and a unit test runs the workflow's own shell against a stub to pin the policy |
+| Nov 25, 2026 | EIA's worst slow spell so far (timeouts, 502s and 504s). The resume loop used up all three attempts on the scheduled run and again on a re-run four hours later, because every attempt started over at the first of the 22 (route, BA) requests. One attempt finished at least 18 of the 22 before a request gave out; the next two began again from the top and died sooner | Each attempt now records the pairs it finishes in a checkpoint file and the next one fetches only the rest. The step gets five attempts instead of three, and each request seven tries instead of five (in the logs, a fifth try after four failures still succeeded 6 times in 15). The ingest log names the pair that failed and times every pair, and a test puts the same failure pattern through the workflow's own shell |
 
 Levers, all from **Actions → Nightly refresh → Run workflow** or repo settings:
 
@@ -268,10 +269,11 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
   marts carry completeness flags, so the gap stays visible); four or more
   usually means something is broken on our side, because independent
   operators don't go dark together, and the build stops before publish.
-- **57 Python unit tests**: the nightly path end to end (incremental
+- **66 Python unit tests**: the nightly path end to end (incremental
   lookback as one request, bootstrap and long catch-ups in month windows,
-  exit codes 2/3/4, and the workflow's resume-on-exit-4 loop, run from
-  `nightly.yml` against a stub ingest),
+  resuming from a checkpoint, exit codes 2/3/4, and the workflow's
+  resume-on-exit-4 loop, run from `nightly.yml` against a stub ingest and
+  again against the real one with a scripted EIA client),
   the publish script (retries, source guards, touched partitions and the
   escalation to a full replace),
   pagination (with truncation detection),

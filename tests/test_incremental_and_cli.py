@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -13,15 +13,20 @@ from grid_pipeline.config import load_config
 
 
 class _Stub:
-    """API-shaped stub: one row at each window's end; optionally raises."""
+    """API-shaped stub: one row at each window's end; optionally raises.
 
-    def __init__(self, exc: Exception | None = None):
+    ``fail_at`` is the 1-based number of the one call that raises ``exc``;
+    without it, ``exc`` is raised on every call.
+    """
+
+    def __init__(self, exc: Exception | None = None, fail_at: int | None = None):
         self.calls: list[tuple[str, str, str, str]] = []
         self.exc = exc
+        self.fail_at = fail_at
 
     def iter_rows(self, route, *, facets=None, start=None, end=None, tiebreak_column=None):
         self.calls.append((route, facets["respondent"][0], start, end))
-        if self.exc:
+        if self.exc and self.fail_at in (None, len(self.calls)):
             raise self.exc
         key = "type" if "region-data" in route else "fueltype"
         yield {"period": end, "respondent": facets["respondent"][0],
@@ -96,6 +101,123 @@ def test_incremental_catch_up_after_stale_watermark_uses_month_windows(con, cfg)
     stub = _Stub()
     ingest.run_incremental(cfg, con, stub)
     assert all(s[:7] == e[:7] for _, _, s, e in stub.calls), stub.calls[:2]
+
+
+# --- resuming from a checkpoint ------------------------------------------- #
+
+EXHAUSTED = EIAError("EIA API still failing after 7 attempts (ReadTimeout)")
+
+
+@pytest.fixture()
+def cfg3(cfg):
+    return dataclasses.replace(cfg, balancing_authorities=["CISO", "ERCO", "PJM"])
+
+
+def _seed_recent_watermarks(con, cfg) -> None:
+    """Every pair a few hours behind, so each one is a single request."""
+    wm = datetime.now(UTC).replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    for route in ("region_data", "fuel_mix"):
+        for ba in cfg.balancing_authorities:
+            db.set_watermark(con, route, ba, wm - timedelta(hours=5))
+
+
+def _pairs(stub: _Stub) -> list[str]:
+    """The stub's calls as 'route_key/BA', in order."""
+    key = {"region-data": "region_data", "fuel-type-data": "fuel_mix"}
+    return [f"{key[route.rsplit('/', 1)[-1]]}/{ba}" for route, ba, _, _ in stub.calls]
+
+
+def test_checkpoint_resume_fetches_only_the_unfinished_pairs(con, cfg3, tmp_path, caplog):
+    """A re-run after a failure picks up at the failed pair, not at the first."""
+    _seed_recent_watermarks(con, cfg3)
+    checkpoint = tmp_path / "ingest-checkpoint"
+
+    first = _Stub(exc=EXHAUSTED, fail_at=2)
+    with pytest.raises(EIAError), caplog.at_level("INFO", logger="grid_pipeline.ingest"):
+        ingest.run_incremental(cfg3, con, first, checkpoint=checkpoint)
+    assert _pairs(first) == ["region_data/CISO", "region_data/ERCO"]
+    assert checkpoint.read_text().split() == ["region_data/CISO"]
+    assert "region_data/ERCO failed" in caplog.text  # the log names the pair
+    assert db.get_load_meta(con, "last_incremental_at") is None
+
+    second = _Stub()
+    with caplog.at_level("INFO", logger="grid_pipeline.ingest"):
+        ingest.run_incremental(cfg3, con, second, checkpoint=checkpoint)
+    assert _pairs(second) == ["region_data/ERCO", "region_data/PJM",
+                              "fuel_mix/CISO", "fuel_mix/ERCO", "fuel_mix/PJM"]
+    assert "1 of 6 pairs already refreshed" in caplog.text
+    assert db.get_load_meta(con, "last_incremental_at") is not None
+
+
+def test_a_finished_run_leaves_no_checkpoint_behind(con, cfg3, tmp_path):
+    """A leftover file would make the next night skip every pair."""
+    _seed_recent_watermarks(con, cfg3)
+    checkpoint = tmp_path / "ingest-checkpoint"
+    ingest.run_incremental(cfg3, con, _Stub(), checkpoint=checkpoint)
+    assert not checkpoint.exists()
+    again = _Stub()
+    ingest.run_incremental(cfg3, con, again, checkpoint=checkpoint)
+    assert len(again.calls) == 6
+
+
+def test_without_a_checkpoint_a_rerun_starts_over(con, cfg3):
+    """The default is unchanged: `make incremental` always fetches every pair."""
+    _seed_recent_watermarks(con, cfg3)
+    with pytest.raises(EIAError):
+        ingest.run_incremental(cfg3, con, _Stub(exc=EXHAUSTED, fail_at=2))
+    again = _Stub()
+    ingest.run_incremental(cfg3, con, again)
+    assert len(again.calls) == 6
+
+
+def test_checkpoint_lists_a_pair_only_when_all_its_windows_loaded(con, cfg, tmp_path):
+    """A catch-up that dies between month windows is not a finished pair."""
+    for route in ("region_data", "fuel_mix"):
+        db.set_watermark(con, route, "CISO", datetime(2026, 2, 10))
+    checkpoint = tmp_path / "ingest-checkpoint"
+    with pytest.raises(EIAError):  # February loads, March fails
+        ingest.run_incremental(cfg, con, _Stub(exc=EXHAUSTED, fail_at=2),
+                               checkpoint=checkpoint)
+    assert not checkpoint.exists()
+
+    resumed = _Stub()
+    ingest.run_incremental(cfg, con, resumed, checkpoint=checkpoint)
+    # Re-entered at its own watermark (the end of February), not skipped.
+    lookback = timedelta(hours=cfg.incremental_lookback_hours)
+    assert _pairs(resumed)[0] == "region_data/CISO"
+    assert _p(resumed.calls[0][2]) == datetime(2026, 2, 28, 23) - lookback
+
+
+def test_main_checkpoint_resumes_across_invocations(tmp_path, monkeypatch):
+    """What the nightly's retry loop does: the same command, three times."""
+    path = tmp_path / "w.duckdb"
+    monkeypatch.setenv("GRID_DB_PATH", str(path))
+    monkeypatch.setenv("EIA_API_KEY", "dummy")
+    cfg = load_config()
+    c = db.connect(str(path))
+    _seed_recent_watermarks(c, cfg)
+    c.close()
+    n_pairs = 2 * len(cfg.balancing_authorities)
+
+    clients = [_Stub(exc=EXHAUSTED, fail_at=4), _Stub(exc=EXHAUSTED, fail_at=1), _Stub()]
+    queue = iter(clients)
+    monkeypatch.setattr(ingest, "EIAClient", lambda **kw: next(queue))
+    checkpoint = tmp_path / "not-created-yet" / "ingest-checkpoint"
+    argv = ["--mode", "incremental", "--checkpoint", str(checkpoint)]
+
+    assert [ingest.main(argv) for _ in clients] == [4, 4, 0]
+    # Three pairs, then the fourth fails twice, then the fourth and the rest:
+    # every pair is fetched successfully exactly once.
+    assert [len(client.calls) for client in clients] == [4, 1, n_pairs - 3]
+    assert _pairs(clients[1]) == [_pairs(clients[0])[3]] == [_pairs(clients[2])[0]]
+    assert not checkpoint.exists()
+
+
+def test_checkpoint_flag_is_incremental_only(tmp_path):
+    with pytest.raises(SystemExit) as err:
+        ingest.main(["--mode", "backfill", "--checkpoint", str(tmp_path / "c")])
+    assert err.value.code == 2
+    assert not (tmp_path / "c").exists()
 
 
 @pytest.mark.parametrize("exc,code", [(ThrottledError("slow down"), 3), (EIAError("boom"), 4)])

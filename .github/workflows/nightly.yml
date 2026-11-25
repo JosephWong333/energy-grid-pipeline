@@ -42,7 +42,10 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # A normal night takes ~3 minutes. The budget is for EIA's slow spells:
+    # on Nov 25 one pass over the 22 requests ran at over a minute each, and
+    # the ingest step may pause and resume four times.
+    timeout-minutes: 120
 
     # id-token: write lets the runner mint the OIDC token that Google exchanges
     # for a short-lived credential. Without it, auth fails on a missing token.
@@ -68,27 +71,32 @@ jobs:
           pip install -r requirements.lock
           pip install -e . --no-deps
 
-      # EIA's API has slow spells: read timeouts and 504s that can use up the
-      # client's five attempts on a single request. Three nights went red
-      # that way (Oct 17, Oct 19, Nov 15). Exit code 4 means "nothing from
-      # the failing window was loaded; re-run the same command to resume",
-      # so this step does that itself after a pause, up to INGEST_ATTEMPTS
-      # runs in total. Nothing else is retried: 2 is the contamination
-      # guard, 3 means EIA asked for a wait longer than the client's cap
-      # (tomorrow's run resumes), and 1 is a crash. A night that needed
-      # another attempt stays green and carries a warning annotation, so
-      # slow spells stay visible on the run page.
+      # EIA's API has slow spells: read timeouts and 504s that can use up
+      # every one of the client's tries on a single request. Three nights
+      # went red that way (Oct 17, Oct 19, Nov 15). Exit code 4 means
+      # "nothing from the failing window was loaded; re-run the same
+      # command to resume", so this step does that itself after a pause,
+      # up to INGEST_ATTEMPTS runs in total. The checkpoint file is what
+      # makes each of those a resume: it lists the (route, BA) pairs
+      # already refreshed, and the next attempt fetches only the rest.
+      # Before it, every attempt started again at the first pair: on
+      # Nov 25 one attempt finished at least 18 of the 22 and the next
+      # two, starting over, died sooner. Nothing else is retried: 2 is the
+      # contamination guard, 3 means EIA asked for a wait longer than the
+      # client's cap (tomorrow's run resumes), and 1 is a crash. A night
+      # that needed another attempt stays green and carries a warning
+      # annotation, so slow spells stay visible on the run page.
       - name: Incremental ingest (EIA API -> MotherDuck)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
-          INGEST_ATTEMPTS: "3"
+          INGEST_ATTEMPTS: "5"
           INGEST_RETRY_WAIT_SECONDS: "300"
         run: |
           attempt=1
           while true; do
             code=0
-            python -m grid_pipeline.ingest --mode incremental || code=$?
+            python -m grid_pipeline.ingest --mode incremental --checkpoint "$RUNNER_TEMP/ingest-checkpoint" || code=$?
             if [ "$code" -ne 4 ] || [ "$attempt" -ge "$INGEST_ATTEMPTS" ]; then
               exit "$code"
             fi
