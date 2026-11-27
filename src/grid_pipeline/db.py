@@ -6,10 +6,11 @@ Design notes
   INSERT OR REPLACE, so every load is idempotent: re-running a window (after
   a crash, or deliberately for the late-arrival lookback) replaces rather
   than duplicates.
-* Every raw row records its provenance in ``_source`` ('eia_api' or
-  'dev_fixtures'). Provenance lives on the rows themselves — not only in a
-  global flag — so synthetic data can never masquerade as real data even if
-  metadata is lost or a warehouse is loaded from mixed runs.
+* Every raw row records its provenance in ``_source`` ('eia_api',
+  'eia_bulk' or 'dev_fixtures'). Provenance lives on the rows themselves —
+  not only in a global flag — so synthetic data can never masquerade as
+  real data even if metadata is lost or a warehouse is loaded from mixed
+  runs.
 * Writes are vectorized: rows are registered as a DataFrame and inserted
   with a single INSERT OR REPLACE ... SELECT. This is ~300x faster than
   per-row executemany (measured: ~490 rows/s vs ~160k rows/s), which is the
@@ -148,6 +149,23 @@ def warehouse_sources(con: duckdb.DuckDBPyConnection) -> set[str]:
         "UNION SELECT DISTINCT _source FROM raw.eia_fuel_mix"
     ).fetchall()
     return {row[0] for row in result}
+
+
+def window_rows(
+    con: duckdb.DuckDBPyConnection,
+    route_key: str,
+    respondent: str,
+    start: datetime,
+    end: datetime,
+) -> dict[tuple[datetime, str], tuple[float | None, str]]:
+    """What one BA already has in [start, end]: {(period, code): (value, _source)}."""
+    result = con.execute(
+        f"SELECT period_utc, {CODE_COL_FOR_ROUTE[route_key]}, value, _source "
+        f"FROM {TABLE_FOR_ROUTE[route_key]} "
+        "WHERE respondent = ? AND period_utc BETWEEN ? AND ?",
+        [respondent, start, end],
+    ).fetchall()
+    return {(period, code): (value, source) for period, code, value, source in result}
 
 
 def get_watermark(

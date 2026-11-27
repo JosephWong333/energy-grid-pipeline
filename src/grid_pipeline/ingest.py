@@ -14,10 +14,30 @@ incremental  Per (route, BA): if a watermark exists, re-fetch a trailing
              crash-safe as a local backfill. With --checkpoint, a re-run
              after a failure fetches only the pairs the failed run did
              not finish.
+fallback     For a night the API does not answer: load the hours the
+             warehouse lacks from EIA's bulk file (see bulk.py). It only
+             adds rows the warehouse does not have, only for a pair where
+             the file agrees with what the API already delivered, and it
+             never moves a watermark, so the API's next answer re-fetches
+             and replaces what it loaded. Prints one line saying what it
+             did.
 fixtures     Load seeded synthetic pages through the REAL parse and
              upsert code — used by CI and local dev. (It skips the HTTP
              client and the per-window response checks, which pytest
              covers with stubbed sessions.)
+
+Exit codes
+----------
+0  done
+1  a crash (a bug)
+2  the contamination guard refused the warehouse
+3  EIA asked for a wait longer than the client's cap; resume later
+4  EIA said no or sent something wrong (a 4xx, a response that failed a
+   check, a bulk file that is not laid out as expected)
+5  EIA did not answer: timeouts or 5xx on every try
+
+After 3, 4 and 5 everything already loaded is saved, and re-running the same
+command resumes.
 
 Contamination guards
 --------------------
@@ -40,9 +60,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import db
-from .client import PERIOD_FORMAT, EIAClient, EIAError, ThrottledError, parse_row
+from .bulk import BulkClient
+from .client import (
+    PERIOD_FORMAT,
+    EIAClient,
+    EIAError,
+    EIARow,
+    ThrottledError,
+    UnavailableError,
+    gateway_status,
+    parse_row,
+)
 from .config import REPO_ROOT, get_api_key, load_config
-from .provenance import SOURCE_API, SOURCE_FIXTURES, data_provenance
+from .provenance import SOURCE_API, SOURCE_BULK, SOURCE_FIXTURES, data_provenance
 
 log = logging.getLogger("grid_pipeline.ingest")
 
@@ -50,6 +80,14 @@ FIXTURES_DB_DEFAULT = "data/dev_fixtures.duckdb"
 # Longer incremental ranges are fetched in month windows, like a backfill.
 MAX_SINGLE_REQUEST_SPAN = timedelta(days=31)
 FIXTURE_PAGES_DIR = REPO_ROOT / "data" / "sample"
+# The bulk file is trusted for a pair only where it agrees with what the API
+# already delivered: at least FALLBACK_MIN_SHARED values present in both, and
+# at least FALLBACK_MIN_AGREEMENT of them equal. Measured on Nov 27, 2026:
+# nine BAs agreed on every value and the two with missing reports on 94%.
+# Read one hour off, the same file agrees on at most 1% of a BA's region
+# values and 38% of its fuel values (series that sit at zero or stay flat).
+FALLBACK_MIN_SHARED = 24
+FALLBACK_MIN_AGREEMENT = 0.8
 
 
 def build_routes(cfg) -> list[dict]:
@@ -132,8 +170,9 @@ def _month_windows(start: datetime, end: datetime):
         cursor = nxt
 
 
-def _load_window(con, client, route: dict, ba: str, start: datetime, end: datetime,
-                 source: str, advance_watermark: bool = True) -> int:
+def _fetch_window(client, route: dict, ba: str, start: datetime,
+                  end: datetime) -> list[EIARow]:
+    """One window's rows, parsed and checked. Nothing is written."""
     rows = [
         parse_row(rec, route["series_key"])
         for rec in client.iter_rows(
@@ -167,6 +206,12 @@ def _load_window(con, client, route: dict, ba: str, start: datetime, end: dateti
         raise EIAError(
             f"{route['key']}/{ba}: unexpected value-units {sorted(odd_units)} "
             "— refusing to publish values whose unit is unverified.")
+    return rows
+
+
+def _load_window(con, client, route: dict, ba: str, start: datetime, end: datetime,
+                 source: str, advance_watermark: bool = True) -> int:
+    rows = _fetch_window(client, route, ba, start, end)
     n = db.upsert_rows(con, route["key"], rows, source=source)
     if rows and advance_watermark:
         db.set_watermark(con, route["key"], ba, max(r.period_utc for r in rows))
@@ -292,6 +337,90 @@ def run_incremental(cfg, con, client, checkpoint: Path | None = None) -> None:
     log.info("Incremental complete: %d rows upserted", total)
 
 
+def run_fallback(cfg, con, bulk) -> str:
+    """Load the hours the warehouse lacks from EIA's bulk file.
+
+    For a night the API did not answer. Three rules keep the second source
+    from ever leaving the warehouse worse than it found it:
+
+    * Only rows the warehouse does not have are added, plus rows an earlier
+      fallback added, which a newer file may correct. A row the API
+      delivered is never touched: restating those is the API's job, and the
+      file can be older than the row it would replace.
+    * A pair is loaded only if the file agrees with the API rows already
+      here (FALLBACK_MIN_SHARED, FALLBACK_MIN_AGREEMENT). A file whose
+      layout, hours or units have changed fails that check.
+    * No watermark moves. The API's next answer therefore re-fetches from
+      the same point as if this had never run, and replaces these rows.
+
+    Returns one sentence saying what happened, for the nightly's warning.
+    """
+    now = datetime.now(UTC).replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    lookback = timedelta(hours=cfg.incremental_lookback_hours)
+    checked, loaded = 0, 0
+    filled: list[str] = []
+    refused: list[str] = []
+    newest: datetime | None = None
+    for route in build_routes(cfg):
+        for ba in cfg.balancing_authorities:
+            pair = f"{route['key']}/{ba}"
+            wm = db.get_watermark(con, route["key"], ba)
+            if wm is None:
+                log.info("%s has no watermark: the bulk file does not start a pair", pair)
+                continue
+            checked += 1
+            start = wm - lookback
+            rows = _fetch_window(bulk, route, ba, start, now)
+            have = db.window_rows(con, route["key"], ba, start, now)
+            shared = same = 0
+            fill: list[EIARow] = []
+            for row in rows:
+                value, source = have.get((row.period_utc, row.series), (None, None))
+                if source == SOURCE_API:
+                    shared += 1
+                    same += value == row.value
+                elif source in (None, SOURCE_BULK):
+                    fill.append(row)
+            if shared < FALLBACK_MIN_SHARED:
+                log.warning("%s: left alone. Only %d values to check the bulk file "
+                            "against, and %d are needed", pair, shared, FALLBACK_MIN_SHARED)
+                refused.append(pair)
+                continue
+            if same < FALLBACK_MIN_AGREEMENT * shared:
+                log.warning("%s: left alone. The bulk file and the API agree on "
+                            "only %d of the %d values both have", pair, same, shared)
+                refused.append(pair)
+                continue
+            n = db.upsert_rows(con, route["key"], fill, source=SOURCE_BULK)
+            log.info("%s: %d rows from the bulk file, which agrees with the API "
+                     "on %d of the %d values both have", pair, n, same, shared)
+            if n:
+                loaded += n
+                filled.append(pair)
+                top = max(r.period_utc for r in fill)
+                newest = top if newest is None else max(newest, top)
+    if checked and len(refused) == checked:
+        raise EIAError("The bulk file could not be confirmed against the API's rows "
+                       "for any pair; nothing was loaded from it.")
+    db.set_load_meta(con, "last_fallback_at", datetime.now(UTC).isoformat())
+    written = (f"written {bulk.last_modified:%Y-%m-%d %H:%M} UTC"
+               if bulk.last_modified else "write time unknown")
+    if not checked:
+        summary = "No pair has a watermark yet, so the bulk file had nothing to fill."
+    elif loaded:
+        summary = (f"Loaded {loaded:,} rows for {len(filled)} of {checked} pairs from "
+                   f"EIA's bulk file ({written}), through {newest:%Y-%m-%dT%H} UTC. The "
+                   "API's own rows replace them on the next night it answers.")
+    else:
+        summary = f"EIA's bulk file ({written}) holds nothing the warehouse lacks."
+    if refused:
+        more = f" and {len(refused) - 4} more" if len(refused) > 4 else ""
+        summary += (" Left alone, because the file could not be confirmed against "
+                    f"the API's rows there: {', '.join(refused[:4])}{more}.")
+    log.info("Fallback complete: %s", summary)
+    return summary
+
+
 def run_fixtures(cfg, con) -> None:
     # Deterministic by construction: the contamination guard has already
     # proven this warehouse contains nothing real, so wipe raw state and
@@ -329,7 +458,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["backfill", "incremental", "fixtures"],
+    parser.add_argument("--mode",
+                        choices=["backfill", "incremental", "fallback", "fixtures"],
                         required=True)
     parser.add_argument(
         "--replay-since", metavar="YYYY-MM-DD",
@@ -359,6 +489,13 @@ def main(argv: list[str] | None = None) -> int:
         guard_against_contamination(con, args.mode, db_path)
         if args.mode == "fixtures":
             run_fixtures(cfg, con)
+        elif args.mode == "fallback":
+            # One line for the log of an outage night: is it the gateway or
+            # the data service behind it that is not answering?
+            log.info("EIA's API, asked without a key: %s",
+                     gateway_status(cfg.eia.base_url))
+            # The only line on stdout, so the nightly can quote it.
+            print(run_fallback(cfg, con, BulkClient(cfg.balancing_authorities)))
         else:
             client = EIAClient(
                 api_key=get_api_key(),
@@ -381,6 +518,12 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Progress up to this point is saved; re-run the same command "
                   "to resume.")
         return 3
+    except UnavailableError as exc:
+        log.error("%s", exc)
+        log.error("EIA is not answering. Nothing from the failing window was "
+                  "loaded; completed windows are saved. Re-run the same "
+                  "command to resume.")
+        return 5
     except EIAError as exc:
         log.error("%s", exc)
         log.error("Nothing from the failing window was loaded; completed "

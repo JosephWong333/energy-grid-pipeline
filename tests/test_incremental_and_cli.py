@@ -8,7 +8,13 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from grid_pipeline import db, ingest
-from grid_pipeline.client import PERIOD_FORMAT, EIAError, EIARow, ThrottledError
+from grid_pipeline.client import (
+    PERIOD_FORMAT,
+    EIAError,
+    EIARow,
+    ThrottledError,
+    UnavailableError,
+)
 from grid_pipeline.config import load_config
 
 
@@ -105,7 +111,7 @@ def test_incremental_catch_up_after_stale_watermark_uses_month_windows(con, cfg)
 
 # --- resuming from a checkpoint ------------------------------------------- #
 
-EXHAUSTED = EIAError("EIA API still failing after 7 attempts (ReadTimeout)")
+EXHAUSTED = UnavailableError("EIA API still failing after 7 attempts (ReadTimeout)")
 
 
 @pytest.fixture()
@@ -205,7 +211,7 @@ def test_main_checkpoint_resumes_across_invocations(tmp_path, monkeypatch):
     checkpoint = tmp_path / "not-created-yet" / "ingest-checkpoint"
     argv = ["--mode", "incremental", "--checkpoint", str(checkpoint)]
 
-    assert [ingest.main(argv) for _ in clients] == [4, 4, 0]
+    assert [ingest.main(argv) for _ in clients] == [5, 5, 0]
     # Three pairs, then the fourth fails twice, then the fourth and the rest:
     # every pair is fetched successfully exactly once.
     assert [len(client.calls) for client in clients] == [4, 1, n_pairs - 3]
@@ -220,7 +226,11 @@ def test_checkpoint_flag_is_incremental_only(tmp_path):
     assert not (tmp_path / "c").exists()
 
 
-@pytest.mark.parametrize("exc,code", [(ThrottledError("slow down"), 3), (EIAError("boom"), 4)])
+@pytest.mark.parametrize("exc,code", [
+    (ThrottledError("slow down"), 3),  # EIA asked for a long wait
+    (EIAError("boom"), 4),             # EIA said no, or sent something wrong
+    (EXHAUSTED, 5),                    # EIA did not answer
+])
 def test_main_exit_codes(tmp_path, monkeypatch, exc, code):
     # Set GRID_DB_PATH explicitly: load_config() loads .env, and a developer
     # .env pointing at md:energy_grid must never retarget a test.

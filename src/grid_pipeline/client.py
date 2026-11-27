@@ -74,6 +74,16 @@ class ThrottledError(EIAError):
     """The server demanded a wait beyond our cap. Resume the run later."""
 
 
+class UnavailableError(EIAError):
+    """EIA did not answer: every try ended in a timeout or a 5xx.
+
+    Nothing is wrong with the request or the data; the service is not
+    there. That is different from the other EIAErrors, where the API said
+    no (a 4xx) or sent something that failed a check, so callers can tell
+    an outage apart from a problem that needs a person.
+    """
+
+
 @dataclass(frozen=True)
 class EIARow:
     """One parsed observation from any /rto/ route."""
@@ -115,6 +125,24 @@ def parse_row(record: dict[str, Any], series_key: str) -> EIARow:
         raise EIAError(
             f"Malformed EIA record ({type(exc).__name__}: {exc}): {str(record)[:300]}"
         ) from exc
+
+
+def gateway_status(base_url: str, timeout: float = 10.0) -> str:
+    """One request without a key: is anything answering at the API's address?
+
+    The gateway in front of the API turns a keyless request away by itself
+    (403, in well under a second on Nov 27, 2026), whatever state the data
+    service behind it is in. So a 403 here, next to timeouts on real
+    requests, says the network and the gateway are fine and the data
+    service is what is silent. No answer here says the trouble is nearer:
+    the gateway, or the road to it.
+    """
+    began = time.monotonic()
+    try:
+        resp = requests.get(f"{base_url}/", timeout=timeout)
+    except requests.RequestException as exc:
+        return f"no answer in {time.monotonic() - began:.1f}s ({type(exc).__name__})"
+    return f"HTTP {resp.status_code} in {time.monotonic() - began:.1f}s"
 
 
 class EIAClient:
@@ -167,6 +195,7 @@ class EIAClient:
         merged = {"api_key": self.api_key, **params}
 
         last_error = ""
+        outage = False  # was the last failure a timeout, a dropped connection or a 5xx?
         for attempt in range(self.max_retries):
             self._throttle()
             try:
@@ -182,6 +211,8 @@ class EIAClient:
             except TRANSPORT_ERRORS as exc:
                 wait = self.backoff_base_seconds * (2**attempt)
                 last_error = type(exc).__name__
+                # A 200 that is not JSON is an answer, just a wrong one.
+                outage = not isinstance(exc, requests.exceptions.JSONDecodeError)
                 logger.warning(
                     "Transport error on %s (attempt %d/%d): %s — retrying in %.1fs",
                     route, attempt + 1, self.max_retries, last_error, wait,
@@ -202,6 +233,8 @@ class EIAClient:
                 else:
                     wait = self.backoff_base_seconds * (2**attempt)
                 last_error = f"HTTP {resp.status_code}"
+                # Being rate limited is about this client, not an outage.
+                outage = resp.status_code != 429
                 logger.warning(
                     "EIA %s on %s (attempt %d/%d) — retrying in %.1fs",
                     resp.status_code, route, attempt + 1, self.max_retries, wait,
@@ -215,8 +248,8 @@ class EIAClient:
                 f"{self._redact(resp.text)[:500]}"
             )
 
-        raise EIAError(
-            f"EIA API still failing after {self.max_retries} attempts ({last_error})")
+        message = f"EIA API still failing after {self.max_retries} attempts ({last_error})"
+        raise UnavailableError(message) if outage else EIAError(message)
 
     # ------------------------------------------------------------------ #
     # Pagination

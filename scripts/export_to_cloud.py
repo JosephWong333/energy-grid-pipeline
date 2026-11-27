@@ -189,7 +189,7 @@ def refuse_unsafe_source(
     if verdict != "real":
         sys.exit(
             f"error: refusing to publish {verdict} data from {db_path}: only a "
-            "warehouse whose every raw row came from the EIA API is publishable."
+            "warehouse whose every raw row came from EIA is publishable."
         )
     if not is_cloud_path(db_path) and not allow_local:
         sys.exit(

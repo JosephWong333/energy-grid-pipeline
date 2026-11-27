@@ -71,6 +71,21 @@ def test_refuses_fixture_data_but_dry_run_is_allowed(export, tmp_path):
     export.refuse_unsafe_source(con, "md:energy_grid", dry_run=True, allow_local=False)
 
 
+def test_rows_from_eias_bulk_file_are_publishable(export, tmp_path):
+    # A night the API was silent leaves 'eia_bulk' rows next to the API's.
+    # They are EIA's data and must not block the publish.
+    con = _warehouse(tmp_path, "eia_api")
+    db.upsert_rows(con, "region_data",
+                   [EIARow(datetime(2026, 9, 1, 8), "CISO", "D", 2.0, "megawatthours")],
+                   source="eia_bulk")
+    export.refuse_unsafe_source(con, "md:energy_grid", dry_run=False, allow_local=False)
+    db.upsert_rows(con, "region_data",
+                   [EIARow(datetime(2026, 9, 1, 9), "CISO", "D", 3.0, "megawatthours")],
+                   source="dev_fixtures")
+    with pytest.raises(SystemExit, match="refusing to publish mixed"):
+        export.refuse_unsafe_source(con, "md:energy_grid", dry_run=False, allow_local=False)
+
+
 def test_refuses_a_local_warehouse_unless_allowed(export, tmp_path):
     con = _warehouse(tmp_path, "eia_api")
     with pytest.raises(SystemExit, match="local warehouse"):

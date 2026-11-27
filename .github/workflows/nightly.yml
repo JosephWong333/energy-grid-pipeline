@@ -34,6 +34,11 @@ on:
         description: "Rebuild every dbt model from raw and re-publish all of BigQuery (after seed edits, a new fuel group, fct column changes, or a fuel-currency warning)"
         type: boolean
         default: false
+      ingest_source:
+        description: "Where the ingest reads: the API (a normal run), or only EIA's bulk file (a drill of the fallback; it adds nothing but rows the warehouse lacks)"
+        type: choice
+        options: [api, bulk-file]
+        default: api
 
 concurrency:
   group: nightly-refresh
@@ -73,7 +78,7 @@ jobs:
 
       # EIA's API has slow spells: read timeouts and 504s that can use up
       # every one of the client's tries on a single request. Three nights
-      # went red that way (Oct 17, Oct 19, Nov 15). Exit code 4 means
+      # went red that way (Oct 17, Oct 19, Nov 15). Exit codes 4 and 5 mean
       # "nothing from the failing window was loaded; re-run the same
       # command to resume", so this step does that itself after a pause,
       # up to INGEST_ATTEMPTS runs in total. The checkpoint file is what
@@ -86,24 +91,64 @@ jobs:
       # client's cap (tomorrow's run resumes), and 1 is a crash. A night
       # that needed another attempt stays green and carries a warning
       # annotation, so slow spells stay visible on the run page.
+      #
+      # When the attempts run out, the last exit code decides the night:
+      #   5  EIA's API never answered (timeouts or 5xx on every try). That
+      #      is an outage upstream, not a fault in this pipeline. The step
+      #      then loads the hours the warehouse lacks from EIA's bulk
+      #      file, a copy of the same data on a different server (see
+      #      src/grid_pipeline/bulk.py), and ends with a warning that says
+      #      what it loaded. If the file cannot help either, the warning
+      #      says so and the step still ends green. The build, the publish
+      #      and the freshness check run on what the warehouse holds, and
+      #      the age of that data is the judge: the build's coverage test
+      #      fails once the BAs have fewer than 20 usable hours in the
+      #      last 72 (a little over two days with nothing new), and source
+      #      freshness has its own error threshold. On Nov 26-27 the API
+      #      answered none of 105 tries in three 49-minute runs, and each
+      #      went red at this step.
+      #   4  EIA said no or sent something wrong. The night fails here.
+      #
+      # ingest_source=bulk-file (manual runs only) is the drill: it skips
+      # the API and runs just the fallback, and fails if the fallback does.
       - name: Incremental ingest (EIA API -> MotherDuck)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
           INGEST_ATTEMPTS: "5"
           INGEST_RETRY_WAIT_SECONDS: "300"
+          INGEST_SOURCE: ${{ inputs.ingest_source || 'api' }}
         run: |
+          if [ "$INGEST_SOURCE" = "bulk-file" ]; then
+            summary=$(python -m grid_pipeline.ingest --mode fallback)
+            echo "::notice title=Bulk file drill::$summary"
+            exit 0
+          fi
           attempt=1
           while true; do
             code=0
             python -m grid_pipeline.ingest --mode incremental --checkpoint "$RUNNER_TEMP/ingest-checkpoint" || code=$?
-            if [ "$code" -ne 4 ] || [ "$attempt" -ge "$INGEST_ATTEMPTS" ]; then
+            if [ "$code" -ne 4 ] && [ "$code" -ne 5 ]; then
               exit "$code"
             fi
-            echo "::warning title=Ingest resumed::Attempt $attempt of $INGEST_ATTEMPTS exited 4 (resumable EIA error). Resuming in ${INGEST_RETRY_WAIT_SECONDS}s."
+            if [ "$attempt" -ge "$INGEST_ATTEMPTS" ]; then
+              break
+            fi
+            echo "::warning title=Ingest resumed::Attempt $attempt of $INGEST_ATTEMPTS exited $code (resumable EIA error). Resuming in ${INGEST_RETRY_WAIT_SECONDS}s."
             sleep "$INGEST_RETRY_WAIT_SECONDS"
             attempt=$((attempt + 1))
           done
+          if [ "$code" -eq 5 ]; then
+            fallback=0
+            summary=$(python -m grid_pipeline.ingest --mode fallback) || fallback=$?
+            if [ "$fallback" -eq 0 ]; then
+              echo "::warning title=EIA API silent - bulk file used::EIA's API did not answer in $INGEST_ATTEMPTS attempts. $summary"
+            else
+              echo "::warning title=EIA API silent - no new data::EIA's API did not answer in $INGEST_ATTEMPTS attempts and the bulk file could not fill in (exit code $fallback), so tonight's data is missing or incomplete. The build, the publish and the freshness check still run on what the warehouse holds, and the night fails only if that data is too old for the coverage test or the freshness check."
+            fi
+            exit 0
+          fi
+          exit "$code"
 
       - name: dbt deps
         run: dbt deps --project-dir dbt --profiles-dir dbt

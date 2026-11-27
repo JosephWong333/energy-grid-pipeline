@@ -18,7 +18,7 @@ curve, peak analytics.
 |:---|:---|
 | **Coverage** | 11 US balancing authorities (CAISO, ERCOT, MISO, PJM, NYISO, ISO-NE, SPP, BPA, FPL, Duke, Southern), hourly since 2019 |
 | **Scale** | 7.7M+ raw rows → 746K+ row hourly fact table |
-| **Quality** | 124 dbt data tests + 66 unit tests on every PR, with zero credentials |
+| **Quality** | 124 dbt data tests + 131 unit tests on every PR, with zero credentials |
 | **Runs** | Nightly on GitHub Actions since Aug 2026: EIA → MotherDuck → BigQuery → dashboard |
 | **Security** | Keyless Google auth (Workload Identity Federation): no service-account key exists |
 | **Cost** | $0/month on free tiers |
@@ -82,6 +82,7 @@ It runs unattended every night, and it has broken. What broke, and what changed:
 | Oct 1, 2026 | A review found that fuel data arriving more than a few days after its demand never reached the hourly fact, and that a BA catching up after a lag never reached BigQuery; the nightly stayed green through both | The fact's reprocess window now starts from each BA's fuel edge (capped at 14 days), the publish also re-sends any older day a recent ingest touched, and a new warn-level test flags fact hours that fall behind their fuel data (one `dbt_full_refresh` run heals them) |
 | Oct 17, Oct 19 and Nov 15, 2026 | EIA's API had slow spells (read timeouts and 504s); on three nights one request used up all five of the client's attempts and the nightly went red. Each gap closed on the next green run, which re-fetches the trailing 72 hours | The ingest step now resumes on its own: on the resumable exit code (4) it waits five minutes and runs again, up to three attempts in all. A night that needed one stays green and carries a warning on its run page, and a unit test runs the workflow's own shell against a stub to pin the policy |
 | Nov 25, 2026 | EIA's worst slow spell so far (timeouts, 502s and 504s). The resume loop used up all three attempts on the scheduled run and again on a re-run four hours later, because every attempt started over at the first of the 22 (route, BA) requests. One attempt finished at least 18 of the 22 before a request gave out; the next two began again from the top and died sooner | Each attempt now records the pairs it finishes in a checkpoint file and the next one fetches only the rest. The step gets five attempts instead of three, and each request seven tries instead of five (in the logs, a fifth try after four failures still succeeded 6 times in 15). The ingest log names the pair that failed and times every pair, and a test puts the same failure pattern through the workflow's own shell |
+| Nov 26-27, 2026 | EIA's API answered nothing from 17:48 UTC to at least 08:20 UTC the next morning. The scheduled run and two re-runs each spent all five attempts on the first of the 22 requests: 105 tries in all, 104 read timeouts and one 504. All three ended red at the ingest step with nothing loaded. The next scheduled run, nine hours later, took three minutes and fetched the whole gap | The client now tells "EIA did not answer" (exit code 5) apart from "EIA said no or sent something wrong" (4). When the attempts run out on a 5, the step loads the hours the warehouse lacks from EIA's bulk file, the same data on a different server: only rows the warehouse does not have, only where the file agrees with what the API already delivered, labelled `eia_bulk`, and with no watermark moved, so the API's next answer replaces them. The step then ends with a warning instead of failing, because an outage upstream is not a fault in this pipeline. Old data still fails the night: the coverage test stops the build once the BAs have fewer than 20 usable hours in the last 72 (a little over two days with nothing new), and source freshness errors at 96 hours |
 
 Levers, all from **Actions → Nightly refresh → Run workflow** or repo settings:
 
@@ -95,6 +96,10 @@ Levers, all from **Actions → Nightly refresh → Run workflow** or repo settin
 - Repository variable `PUBLISH_ENABLED=false` skips the Google steps
   entirely (MotherDuck keeps refreshing and the run stays green). When you
   turn it back on, dispatch once with `publish_mode=full`.
+- `ingest_source=bulk-file` is a drill of the outage fallback: it skips the
+  API and reads EIA's bulk file instead. Right after a normal night it finds
+  almost nothing to add, and its log shows, pair by pair, how many values the
+  file and the API's rows share and how many are equal.
 
 ## Quickstart
 
@@ -219,6 +224,20 @@ carries `_source` lineage, and charts fail closed to a watermark unless
 row-level provenance proves the data real. Every PR builds the entire
 warehouse and runs the full test suite.
 
+**A second source for nights the API is silent.** EIA serves the same hourly
+data twice: through the API, and as one CSV per half year from a plain web
+server. When the API has not answered in five attempts, the nightly reads
+that file instead (`src/grid_pipeline/bulk.py`). Checked against the live API
+on Nov 27, 2026: the file's "(Adjusted)" columns are the API's values and its
+UTC end-of-hour timestamp is the API's period. Of 3,325 region values for the
+11 BAs, 33 differed, all of them demand hours EIA had imputed for two BAs
+whose reports were missing. So the file is treated as a snapshot from the
+moment it was written. The fallback adds only rows the warehouse lacks, only
+for a (route, BA) pair where at least 80% of the values both sources hold
+are equal, labels them `eia_bulk`, and moves no watermark, so the API's next
+answer re-fetches the same lookback and replaces them. A file whose header
+has an unknown or missing column is refused outright.
+
 **DuckDB (+ MotherDuck for prod).** The working set is a few million rows —
 an ideal fit for DuckDB locally and MotherDuck as a zero-ops cloud target.
 Same SQL, same dbt project, a one-line profile switch.
@@ -269,11 +288,15 @@ pattern lives in my [Olist pipeline](https://github.com/JosephWong333/olist-mode
   marts carry completeness flags, so the gap stays visible); four or more
   usually means something is broken on our side, because independent
   operators don't go dark together, and the build stops before publish.
-- **66 Python unit tests**: the nightly path end to end (incremental
+- **131 Python unit tests**: the nightly path end to end (incremental
   lookback as one request, bootstrap and long catch-ups in month windows,
-  resuming from a checkpoint, exit codes 2/3/4, and the workflow's
-  resume-on-exit-4 loop, run from `nightly.yml` against a stub ingest and
-  again against the real one with a scripted EIA client),
+  resuming from a checkpoint, exit codes 2/3/4/5, and the workflow's
+  resume loop with its endings, red when EIA said no and the bulk-file
+  fallback plus a warning when EIA never answered, run from `nightly.yml`
+  against a stub ingest and again against the real one with a scripted EIA),
+  the bulk-file fallback (read from a verbatim excerpt of EIA's file and
+  compared with what the API returned for the same hours; what it may add
+  and what it may never overwrite; the agreement check; a changed header),
   the publish script (retries, source guards, touched partitions and the
   escalation to a full replace),
   pagination (with truncation detection),

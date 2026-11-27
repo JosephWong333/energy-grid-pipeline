@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from grid_pipeline.client import EIAClient, EIAError, ThrottledError, parse_row
+from grid_pipeline.client import (
+    EIAClient,
+    EIAError,
+    ThrottledError,
+    UnavailableError,
+    parse_row,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -139,11 +145,63 @@ def test_gives_up_after_max_retries():
         list(client.iter_rows("electricity/rto/region-data"))
 
 
+class _AlwaysRaises(FakeSession):
+    """A session whose every request fails the same way."""
+
+    def __init__(self, exc: Exception):
+        super().__init__([])
+        self._exc = exc
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append({"url": url, "params": dict(params or {})})
+        raise self._exc
+
+
+class _NotJson(FakeResponse):
+    def json(self):
+        import requests as _requests
+        raise _requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
+
+
+def _exhaust(session) -> EIAError:
+    client = EIAClient(api_key="k", session=session, sleep=lambda _: None,
+                       sleep_between_requests=0, max_retries=3)
+    with pytest.raises(EIAError, match="after 3 attempts") as info:
+        list(client.iter_rows("electricity/rto/region-data"))
+    return info.value
+
+
+def test_running_out_of_tries_on_timeouts_or_5xx_is_an_outage():
+    """EIA never answered. Callers may treat that as upstream being down."""
+    import requests as _requests
+
+    assert isinstance(_exhaust(_AlwaysRaises(_requests.ReadTimeout("slow"))), UnavailableError)
+    assert isinstance(_exhaust(_AlwaysRaises(_requests.ConnectionError("reset"))),
+                      UnavailableError)
+    for status in (500, 502, 503, 504):
+        assert isinstance(_exhaust(FakeSession([FakeResponse(status)] * 3)), UnavailableError)
+
+
+def test_running_out_of_tries_on_429_or_bad_json_is_not_an_outage():
+    """EIA did answer: it is rate limiting this client, or sending non-JSON.
+    Someone has to look, so it stays a plain EIAError."""
+    assert not isinstance(_exhaust(FakeSession([FakeResponse(429)] * 3)), UnavailableError)
+    assert not isinstance(_exhaust(FakeSession([_NotJson(200)] * 3)), UnavailableError)
+
+
+def test_the_last_failure_decides_outage_or_not():
+    assert isinstance(_exhaust(FakeSession([FakeResponse(429), FakeResponse(429),
+                                            FakeResponse(503)])), UnavailableError)
+    assert not isinstance(_exhaust(FakeSession([FakeResponse(503), FakeResponse(503),
+                                                FakeResponse(429)])), UnavailableError)
+
+
 def test_non_retryable_error_fails_immediately():
     client, session = make_client([FakeResponse(403, {"error": "invalid api key"})])
-    with pytest.raises(EIAError, match="403"):
+    with pytest.raises(EIAError, match="403") as info:
         list(client.iter_rows("electricity/rto/region-data"))
     assert len(session.calls) == 1
+    assert not isinstance(info.value, UnavailableError)  # EIA answered, and said no
 
 
 # --------------------------------------------------------------------------- #
@@ -244,3 +302,26 @@ def test_error_text_never_carries_the_api_key():
 def test_malformed_record_raises_eia_error_not_a_traceback():
     with pytest.raises(EIAError, match="Malformed EIA record"):
         parse_row({"period": None, "respondent": "CISO", "type": "D"}, "type")
+
+
+def test_gateway_status_reports_the_answer_or_the_silence(monkeypatch):
+    from grid_pipeline import client as client_module
+
+    asked = []
+
+    def answered(url, timeout):
+        asked.append((url, timeout))
+        return FakeResponse(403, {"error": {"code": "API_KEY_MISSING"}})
+
+    monkeypatch.setattr(client_module.requests, "get", answered)
+    status = client_module.gateway_status("https://api.eia.gov/v2")
+    assert status.startswith("HTTP 403 in ") and status.endswith("s")
+    # No key goes out: this request is about the gateway, not the account.
+    assert asked == [("https://api.eia.gov/v2/", 10.0)]
+
+    def silent(url, timeout):
+        raise client_module.requests.ConnectTimeout()
+
+    monkeypatch.setattr(client_module.requests, "get", silent)
+    status = client_module.gateway_status("https://api.eia.gov/v2")
+    assert status.startswith("no answer in ") and status.endswith("(ConnectTimeout)")
